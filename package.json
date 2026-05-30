@@ -1,0 +1,25 @@
+{
+  "name": "@chat-agent/relationship-system",
+  "version": "0.1.0",
+  "description": "Relationship system package for autonomous background task planning",
+  "type": "commonjs",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx tests/service.test.ts && tsx tests/backgroundRunner.test.ts && tsx tests/adapter.test.ts && tsx tests/fileTurnRecordStore.test.ts && tsx tests/fileQueueBackgroundInputSink.test.ts && tsx tests/filePolicyStateStore.test.ts",
+    "start:background": "tsx src/cli/runBackground.ts"
+  },
+  "dependencies": {
+    "@chat-agent/memory-system": "file:../memory-system",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,9 @@
+/.agent-shell/
+.env
+.env.ao
+.env.aka
+.env.db_migration
+lib/
+docs/
+node_modules/
+drizzle/
