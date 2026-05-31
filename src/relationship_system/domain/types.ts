@@ -45,6 +45,8 @@ export type RelationshipExecutionModePreference =
 
 export interface RelationshipTask {
   id: string;
+  unitId: string;
+  unitStep: "organize" | "intervene" | "observe" | "adjust";
   botId: string;
   threadId: string;
   kind: RelationshipTaskKind;
@@ -62,6 +64,8 @@ export interface BackgroundInput {
   threadId: string;
   text: string;
   sourceTaskId: string;
+  sourceUnitId?: string;
+  sourceUnitStep?: "organize" | "intervene" | "observe" | "adjust";
 }
 
 export interface RelationshipPolicy {

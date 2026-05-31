@@ -37,19 +37,22 @@ export interface FileQueueBackgroundInputSinkOptions {
 export const createFileQueueBackgroundInputSink = (
   options: FileQueueBackgroundInputSinkOptions,
 ): BackgroundInputSink => {
-  const lastEnqueuedAtBySourceTaskId = new Map<string, number>();
+  const lastEnqueuedAtBySourceUnitStep = new Map<string, number>();
   const enqueueCooldownMs = options.enqueueCooldownMs ?? 60 * 60 * 1000;
 
   return {
     async enqueue(input: BackgroundInput): Promise<void> {
       const now = Date.now();
-      const lastEnqueuedAt = lastEnqueuedAtBySourceTaskId.get(input.sourceTaskId);
+      const dedupeKey = input.sourceUnitId
+        ? `${input.sourceUnitId}:${input.sourceUnitStep ?? "intervene"}`
+        : input.sourceTaskId;
+      const lastEnqueuedAt = lastEnqueuedAtBySourceUnitStep.get(dedupeKey);
       if (
         lastEnqueuedAt !== undefined &&
         now - lastEnqueuedAt < enqueueCooldownMs
       ) {
         process.stdout.write(
-          `[relationship-system] skipped duplicate threadId=${input.threadId} sourceTaskId=${input.sourceTaskId}\n`,
+          `[relationship-system] skipped duplicate threadId=${input.threadId} key=${dedupeKey}\n`,
         );
         return;
       }
@@ -68,9 +71,9 @@ export const createFileQueueBackgroundInputSink = (
         locked: false,
       });
       await writeQueueFile(options.filePath, items);
-      lastEnqueuedAtBySourceTaskId.set(input.sourceTaskId, now);
+      lastEnqueuedAtBySourceUnitStep.set(dedupeKey, now);
       process.stdout.write(
-        `[relationship-system] queued threadId=${input.threadId} sourceTaskId=${input.sourceTaskId}\n`,
+        `[relationship-system] queued threadId=${input.threadId} key=${dedupeKey}\n`,
       );
     },
   };

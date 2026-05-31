@@ -15,17 +15,36 @@ import {
   RelationshipTurnRecordStore,
   TurnRecord,
 } from "../domain/types";
+import {
+  buildMemoryReportSignature,
+  buildTaskFingerprint,
+  buildThreadKey,
+  planRelationshipTasks,
+  planRelationshipTasksWithLlm,
+  toBackgroundInput,
+} from "./taskPlanning";
 
 export interface RelationshipSystemService {
   ingestTurnRecord(input: TurnRecord): Promise<void>;
   planTasks(input: {
     botId: string;
     threadId: string;
+    userId?: string;
+    channelId?: string;
   }): Promise<RelationshipTask[]>;
   dispatchTasks(input: {
     botId: string;
     threadId: string;
+    userId?: string;
+    channelId?: string;
   }): Promise<BackgroundInput[]>;
+}
+
+interface RelationshipScopeContext {
+  botId: string;
+  threadId: string;
+  userId?: string;
+  channelId?: string;
 }
 
 export interface RelationshipSystemOptions {
@@ -35,9 +54,15 @@ export interface RelationshipSystemOptions {
   backgroundInputSink?: BackgroundInputSink;
   plannerModel?: RelationshipPlanningModel;
   policy?: Partial<RelationshipPolicy>;
+  policyScopeMode?: "thread" | "user" | "hybrid";
+  userScopeMissingUserIdMode?: "fallback_thread" | "skip_user_scope";
+  userScopeKeyResolver?: (input: RelationshipScopeContext) => string | null;
   recentTurnLimit?: number;
   policyLearningTurnLimit?: number;
   executionModeLearningTurnLimit?: number;
+  dispatchSuppressionWindowMs?: number;
+  minTurnAgeMsBeforeLowPriorityDispatch?: number;
+  minPolicyFlipIntervalMs?: number;
   now?: () => Date;
 }
 
@@ -53,6 +78,27 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
   private readonly recentTurnLimit: number;
   private readonly policyLearningTurnLimit: number;
   private readonly executionModeLearningTurnLimit: number;
+  private readonly policyScopeMode: "thread" | "user" | "hybrid";
+  private readonly userScopeKeyResolver: (
+    input: RelationshipScopeContext,
+  ) => string | null;
+  private readonly userScopeMissingUserIdMode:
+    | "fallback_thread"
+    | "skip_user_scope";
+  private readonly dispatchSuppressionWindowMs: number;
+  private readonly minTurnAgeMsBeforeLowPriorityDispatch: number;
+  private readonly minPolicyFlipIntervalMs: number;
+  private readonly lastReportSignatureByThread = new Map<string, string>();
+  private readonly lastDispatchedReportSignatureByThread = new Map<
+    string,
+    string
+  >();
+  private readonly lastDispatchedTaskFingerprintByThread = new Map<
+    string,
+    string
+  >();
+  private readonly lastDispatchedAtByThread = new Map<string, number>();
+  private readonly latestTurnAtByThread = new Map<string, number>();
 
   constructor(private readonly options: RelationshipSystemOptions) {
     this.policy = {
@@ -70,6 +116,23 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       options.executionModeLearningTurnLimit ??
         Math.max(16, this.policyLearningTurnLimit),
     );
+    this.policyScopeMode = options.policyScopeMode ?? "thread";
+    this.userScopeMissingUserIdMode =
+      options.userScopeMissingUserIdMode ?? "fallback_thread";
+    this.userScopeKeyResolver =
+      options.userScopeKeyResolver ?? defaultUserScopeKeyResolver;
+    this.dispatchSuppressionWindowMs = Math.max(
+      0,
+      options.dispatchSuppressionWindowMs ?? 2 * 60 * 60 * 1000,
+    );
+    this.minTurnAgeMsBeforeLowPriorityDispatch = Math.max(
+      0,
+      options.minTurnAgeMsBeforeLowPriorityDispatch ?? 10 * 60 * 1000,
+    );
+    this.minPolicyFlipIntervalMs = Math.max(
+      0,
+      options.minPolicyFlipIntervalMs ?? 30 * 60 * 1000,
+    );
   }
 
   async ingestTurnRecord(input: TurnRecord): Promise<void> {
@@ -79,6 +142,8 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
   async planTasks(input: {
     botId: string;
     threadId: string;
+    userId?: string;
+    channelId?: string;
   }): Promise<RelationshipTask[]> {
     if (!this.options.memoryProvider) {
       throw new Error("memoryProvider is required to plan relationship tasks");
@@ -95,18 +160,37 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
         threadId: input.threadId,
         limit: fetchTurnLimit,
       }),
-      this.options.policyStateStore?.getPolicyState(input) ?? Promise.resolve(null),
+      loadScopedPolicyState(
+        this.options.policyStateStore,
+        input,
+        this.policyScopeMode,
+        this.userScopeKeyResolver,
+        this.userScopeMissingUserIdMode,
+      ),
     ]);
     const learningTurns = recentTurns.slice(-this.policyLearningTurnLimit);
     const executionModeLearningTurns = recentTurns.slice(
       -this.executionModeLearningTurnLimit,
     );
     const summaryTurns = recentTurns.slice(-this.recentTurnLimit);
+    const threadKey = buildThreadKey(input.botId, input.threadId);
+    this.lastReportSignatureByThread.set(
+      threadKey,
+      buildMemoryReportSignature(insights),
+    );
+    const latestTurn = recentTurns[recentTurns.length - 1];
+    if (latestTurn) {
+      const turnTs = Date.parse(latestTurn.createdAtIso);
+      if (Number.isFinite(turnTs)) {
+        this.latestTurnAtByThread.set(threadKey, turnTs);
+      }
+    }
 
     const nextPolicyState = await learnInterventionPolicyState({
       botId: input.botId,
       threadId: input.threadId,
       now: this.now(),
+      minPolicyFlipIntervalMs: this.minPolicyFlipIntervalMs,
       insights,
       recentTurns: learningTurns,
       executionModeLearningTurns,
@@ -115,7 +199,14 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
     });
 
     if (nextPolicyState && this.options.policyStateStore) {
-      await this.options.policyStateStore.savePolicyState(nextPolicyState);
+      await saveScopedPolicyState(
+        this.options.policyStateStore,
+        nextPolicyState,
+        this.policyScopeMode,
+        this.userScopeKeyResolver,
+        this.userScopeMissingUserIdMode,
+        input,
+      );
     }
 
     const recentSummary = this.options.plannerModel
@@ -157,6 +248,8 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
   async dispatchTasks(input: {
     botId: string;
     threadId: string;
+    userId?: string;
+    channelId?: string;
   }): Promise<BackgroundInput[]> {
     if (!this.options.backgroundInputSink) {
       throw new Error(
@@ -164,7 +257,21 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       );
     }
     const tasks = await this.planTasks(input);
+    const threadKey = buildThreadKey(input.botId, input.threadId);
+    const nowMs = this.now().getTime();
     const selected = tasks.slice(0, this.policy.maxBackgroundInputsPerRun);
+    if (
+      this.shouldSuppressDispatch({
+        threadKey,
+        selected,
+        nowMs,
+      })
+    ) {
+      process.stdout.write(
+        `[relationship-system] suppressed dispatch botId=${input.botId} threadId=${input.threadId} selected=${selected.length}\n`,
+      );
+      return [];
+    }
     const backgroundInputs = selected.map(toBackgroundInput);
     process.stdout.write(
       `[relationship-system] planned botId=${input.botId} threadId=${input.threadId} tasks=${tasks.length} dispatch=${backgroundInputs.length}\n`,
@@ -172,7 +279,76 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
     for (const backgroundInput of backgroundInputs) {
       await this.options.backgroundInputSink.enqueue(backgroundInput);
     }
+    if (selected.length > 0) {
+      const reportSignature =
+        this.lastReportSignatureByThread.get(threadKey) ?? "";
+      this.lastDispatchedReportSignatureByThread.set(
+        threadKey,
+        reportSignature,
+      );
+      this.lastDispatchedTaskFingerprintByThread.set(
+        threadKey,
+        buildTaskFingerprint(selected),
+      );
+      this.lastDispatchedAtByThread.set(threadKey, nowMs);
+    }
     return backgroundInputs;
+  }
+
+  private shouldSuppressDispatch(input: {
+    threadKey: string;
+    selected: RelationshipTask[];
+    nowMs: number;
+  }): boolean {
+    if (input.selected.length === 0) {
+      return true;
+    }
+    if (input.selected.some((task) => task.priority === "high")) {
+      return false;
+    }
+    const latestTurnAt = this.latestTurnAtByThread.get(input.threadKey);
+    if (
+      latestTurnAt !== undefined &&
+      input.nowMs - latestTurnAt < this.minTurnAgeMsBeforeLowPriorityDispatch
+    ) {
+      return true;
+    }
+    const reportSignature =
+      this.lastReportSignatureByThread.get(input.threadKey) ?? "";
+    const lastReportSignature =
+      this.lastDispatchedReportSignatureByThread.get(input.threadKey) ?? "";
+    const fingerprint = buildTaskFingerprint(input.selected);
+    const lastFingerprint =
+      this.lastDispatchedTaskFingerprintByThread.get(input.threadKey) ?? "";
+    if (
+      reportSignature &&
+      reportSignature === lastReportSignature &&
+      fingerprint === lastFingerprint
+    ) {
+      return true;
+    }
+
+    const lastAt = this.lastDispatchedAtByThread.get(input.threadKey);
+    const withinWindow =
+      lastAt !== undefined &&
+      input.nowMs - lastAt < this.dispatchSuppressionWindowMs;
+    if (!withinWindow) {
+      return false;
+    }
+    const currentUnitSteps = new Set(
+      input.selected.map((task) => `${task.unitId}:${task.unitStep}`),
+    );
+    const lastUnitSteps = new Set(
+      (lastFingerprint ? lastFingerprint.split("|") : [])
+        .map((entry) => entry.split(":").slice(0, 2).join(":"))
+        .filter(Boolean),
+    );
+    for (const unitStep of currentUnitSteps) {
+      if (lastUnitSteps.has(unitStep)) {
+        return true;
+      }
+    }
+    return false;
   }
 }
 
@@ -180,104 +356,136 @@ export const createRelationshipSystemService = (
   options: RelationshipSystemOptions,
 ): RelationshipSystemService => new DefaultRelationshipSystemService(options);
 
-export const planRelationshipTasks = (
-  insights: RelationshipMemoryInsights,
-  policy: RelationshipPolicy,
-  now: Date,
-): RelationshipTask[] => {
-  const tasks: RelationshipTask[] = [];
-
-  if (insights.report.gaps.length > 0 && policy.askForFeedbackSparingly) {
-    tasks.push(
-      createTask(insights, now, {
-        kind: "feedback_prepare",
-        executionMode: "ask_user",
-        source: insights.report.gaps[0] ?? "gap",
-        title: "Prepare one concise feedback check",
-        purpose:
-          "Clarify one missing preference without interrupting the main task too early.",
-        inputText: `When this topic resumes, ask one concise clarification based on this gap: ${insights.report.gaps[0]}`,
-        priority: "medium",
-        sourceSignals: insights.report.gaps.slice(0, 1),
-      }),
-    );
+const loadScopedPolicyState = async (
+  store: RelationshipPolicyStateStore | undefined,
+  input: RelationshipScopeContext,
+  scopeMode: "thread" | "user" | "hybrid",
+  userScopeKeyResolver: (input: RelationshipScopeContext) => string | null,
+  userScopeMissingUserIdMode: "fallback_thread" | "skip_user_scope",
+): Promise<RelationshipInterventionPolicyState | null> => {
+  if (!store) {
+    return null;
   }
-
-  if (
-    insights.report.staleNotes.length > 0 &&
-    policy.proactiveHelpLevel !== "low"
-  ) {
-    tasks.push(
-      createTask(insights, now, {
-        kind: "info_gathering",
-        executionMode: "collect_info",
-        source: insights.report.staleNotes[0] ?? "stale",
-        title: "Refresh potentially stale context",
-        purpose: "Prepare fresher support before the next related interaction.",
-        inputText: `Before the next related exchange, refresh this potentially stale area: ${insights.report.staleNotes[0]}`,
-        priority: policy.proactiveHelpLevel === "high" ? "high" : "medium",
-        sourceSignals: insights.report.staleNotes.slice(0, 1),
-      }),
-    );
+  const userScopeKey = resolveUserScopeKey(
+    input,
+    userScopeKeyResolver,
+    userScopeMissingUserIdMode,
+  );
+  if (scopeMode === "thread") {
+    const state = await store.getPolicyState(input);
+    return state ? { ...state, threadId: input.threadId } : null;
   }
-
-  if (insights.report.conflicts.length > 0) {
-    tasks.push(
-      createTask(insights, now, {
-        kind: "context_hint",
-        executionMode: "provide_info",
-        source: insights.report.conflicts[0] ?? "conflict",
-        title: "Prepare a distinction hint",
-        purpose:
-          "Avoid repeating a known mismatch by making the boundary explicit next time.",
-        inputText: `Next time this topic appears, apply a brief distinction hint based on: ${insights.report.conflicts[0]}`,
-        priority: "high",
-        sourceSignals: insights.report.conflicts.slice(0, 1),
-      }),
-    );
+  if (scopeMode === "user") {
+    if (!userScopeKey) {
+      return null;
+    }
+    const key = userScopeKey;
+    const state = await store.getPolicyState({
+      botId: input.botId,
+      threadId: key,
+    });
+    return state ? { ...state, threadId: input.threadId } : null;
   }
-
-  if (
-    insights.report.conflicts.length > 0 ||
-    insights.report.gaps.length > 1
-  ) {
-    tasks.push(
-      createTask(insights, now, {
-        kind: "memory_improvement",
-        executionMode: "ask_user",
-        source:
-          insights.report.conflicts[0] ??
-          insights.report.gaps[0] ??
-          "memory-improvement",
-        title: "Clarify a memory boundary",
-        purpose:
-          "Reduce future ambiguity by confirming one distinction the memory system should keep explicit.",
-        inputText: `When this topic returns, confirm one distinction the memory system should preserve: ${insights.report.conflicts[0] ?? insights.report.gaps[0]}`,
-        priority: insights.report.conflicts.length > 0 ? "high" : "medium",
-        sourceSignals: [
-          ...(insights.report.conflicts[0] ? [insights.report.conflicts[0]] : []),
-          ...(insights.report.gaps[0] ? [insights.report.gaps[0]] : []),
-        ],
-      }),
-    );
-  }
-
-  return tasks;
+  const [userState, threadState] = await Promise.all([
+    userScopeKey
+      ? store.getPolicyState({ botId: input.botId, threadId: userScopeKey })
+      : Promise.resolve(null),
+    store.getPolicyState(input),
+  ]);
+  const merged = mergePolicyStates(userState, threadState);
+  return merged ? { ...merged, threadId: input.threadId } : null;
 };
 
-interface PlannedTask {
-  kind?: RelationshipTask["kind"] | string;
-  executionMode?: RelationshipExecutionMode | string;
-  title?: string;
-  purpose?: string;
-  inputText?: string;
-  priority?: RelationshipTask["priority"] | string;
-  sourceSignals?: string[];
-}
+const saveScopedPolicyState = async (
+  store: RelationshipPolicyStateStore,
+  state: RelationshipInterventionPolicyState,
+  scopeMode: "thread" | "user" | "hybrid",
+  userScopeKeyResolver: (input: RelationshipScopeContext) => string | null,
+  userScopeMissingUserIdMode: "fallback_thread" | "skip_user_scope",
+  scopeContext: RelationshipScopeContext,
+): Promise<void> => {
+  const userScopeKey = resolveUserScopeKey(
+    scopeContext,
+    userScopeKeyResolver,
+    userScopeMissingUserIdMode,
+  );
+  if (scopeMode === "thread") {
+    await store.savePolicyState(state);
+    return;
+  }
+  if (scopeMode === "user") {
+    if (!userScopeKey) {
+      return;
+    }
+    await store.savePolicyState({
+      ...state,
+      threadId: userScopeKey,
+    });
+    return;
+  }
+  if (userScopeKey) {
+    await store.savePolicyState({
+      ...state,
+      threadId: userScopeKey,
+    });
+  }
+  await store.savePolicyState(state);
+};
 
-interface PlannedTasksResult {
-  tasks?: PlannedTask[];
-}
+const toUserScopeThreadKey = (threadId: string): string | null => {
+  const index = threadId.lastIndexOf(":");
+  if (index < 0 || index === threadId.length - 1) {
+    return null;
+  }
+  const userId = threadId.slice(index + 1).trim();
+  if (!userId) {
+    return null;
+  }
+  return `user:${userId}`;
+};
+
+const defaultUserScopeKeyResolver = (
+  input: RelationshipScopeContext,
+): string | null => {
+  if (input.userId && input.userId.trim().length > 0) {
+    return `user:${input.userId.trim()}`;
+  }
+  return toUserScopeThreadKey(input.threadId);
+};
+
+const resolveUserScopeKey = (
+  input: RelationshipScopeContext,
+  resolver: (input: RelationshipScopeContext) => string | null,
+  missingUserIdMode: "fallback_thread" | "skip_user_scope",
+): string | null => {
+  const key = resolver(input);
+  if (key && key.trim().length > 0) {
+    return key.trim();
+  }
+  if (missingUserIdMode === "fallback_thread") {
+    return input.threadId;
+  }
+  return null;
+};
+
+const mergePolicyStates = (
+  userState: RelationshipInterventionPolicyState | null,
+  threadState: RelationshipInterventionPolicyState | null,
+): RelationshipInterventionPolicyState | null => {
+  if (!userState && !threadState) {
+    return null;
+  }
+  if (!userState) {
+    return threadState;
+  }
+  if (!threadState) {
+    return userState;
+  }
+  return {
+    ...userState,
+    ...threadState,
+  };
+};
 
 interface FeedbackSummaryResult {
   summary?: string;
@@ -301,168 +509,6 @@ interface ExplicitPreferenceSignals {
   preferredExecutionMode?: RelationshipExecutionModePreference;
 }
 
-export const planRelationshipTasksWithLlm = async (
-  insights: RelationshipMemoryInsights,
-  policy: RelationshipPolicy,
-  now: Date,
-  plannerModel: RelationshipPlanningModel,
-): Promise<RelationshipTask[]> => {
-  const parsed = await plannerModel.generateJson<PlannedTasksResult>(
-    [
-      "You plan lightweight relationship-improvement tasks for an assistant.",
-      "Prefer tasks that either improve the user relationship or improve the memory system.",
-      "Use user feedback implications as the main signal, and numeric counts only as support.",
-      "Keep tasks sparse and avoid intrusive interventions.",
-      "Return JSON only.",
-    ].join(" "),
-    JSON.stringify({
-      instruction: [
-        "Read the memory report and recent context summary.",
-        "Decide what should be prepared next.",
-        "Prefer one concise feedback task when a gap should be clarified.",
-        "Use memory_improvement when the memory system itself should be refined or clarified.",
-        "Return tasks[]. Each task needs kind, executionMode, title, purpose, inputText, priority, sourceSignals.",
-      ].join(" "),
-      policy,
-      numericSignals: {
-        gapCount: insights.report.gaps.length,
-        staleCount: insights.report.staleNotes.length,
-        conflictCount: insights.report.conflicts.length,
-      },
-      insights,
-    }),
-  );
-
-  const tasks = (parsed.tasks ?? [])
-    .map((task, index) => normalizeTask(task, insights, now, index))
-    .filter((task): task is RelationshipTask => task !== null);
-
-  return tasks.slice(0, Math.max(1, policy.maxBackgroundInputsPerRun));
-};
-
-const toBackgroundInput = (task: RelationshipTask): BackgroundInput => ({
-  botId: task.botId,
-  threadId: task.threadId,
-  text: task.inputText,
-  sourceTaskId: task.id,
-});
-
-const createTask = (
-  insights: RelationshipMemoryInsights,
-  now: Date,
-  input: {
-    kind: RelationshipTask["kind"];
-    executionMode: RelationshipExecutionMode;
-    source: string;
-    title: string;
-    purpose: string;
-    inputText: string;
-    priority: RelationshipTask["priority"];
-    sourceSignals: string[];
-  },
-): RelationshipTask => ({
-  id: buildTaskId(insights.botId, insights.threadId, input.kind, input.source),
-  botId: insights.botId,
-  threadId: insights.threadId,
-  kind: input.kind,
-  executionMode: input.executionMode,
-  title: input.title,
-  purpose: input.purpose,
-  inputText: input.inputText,
-  priority: input.priority,
-  sourceSignals: input.sourceSignals,
-  createdAtIso: now.toISOString(),
-});
-
-const buildTaskId = (
-  botId: string,
-  threadId: string,
-  kind: RelationshipTask["kind"],
-  source: string,
-): string =>
-  `rel_${sanitizeIdPart(botId)}_${sanitizeIdPart(threadId)}_${kind}_${sanitizeIdPart(source).slice(0, 48)}`;
-
-const sanitizeIdPart = (value: string): string =>
-  value.replace(/[^a-zA-Z0-9_-]/g, "_");
-
-const normalizeTask = (
-  task: PlannedTask,
-  insights: RelationshipMemoryInsights,
-  now: Date,
-  index: number,
-): RelationshipTask | null => {
-  const kind = normalizeKind(task.kind);
-  const title = task.title?.trim();
-  const purpose = task.purpose?.trim();
-  const inputText = task.inputText?.trim();
-  if (!kind || !title || !purpose || !inputText) {
-    return null;
-  }
-  return {
-    id: buildTaskId(
-      insights.botId,
-      insights.threadId,
-      kind,
-      `${index}_${title}`,
-    ),
-    botId: insights.botId,
-    threadId: insights.threadId,
-    kind,
-    executionMode: normalizeExecutionMode(task.executionMode, kind),
-    title,
-    purpose,
-    inputText,
-    priority: normalizePriority(task.priority),
-    sourceSignals: (task.sourceSignals ?? [])
-      .map((signal) => signal.trim())
-      .filter(Boolean),
-    createdAtIso: now.toISOString(),
-  };
-};
-
-const normalizeKind = (
-  value: RelationshipTask["kind"] | string | undefined,
-): RelationshipTask["kind"] | null => {
-  if (
-    value === "feedback_prepare" ||
-    value === "info_gathering" ||
-    value === "context_hint" ||
-    value === "memory_improvement"
-  ) {
-    return value;
-  }
-  return null;
-};
-
-const normalizeExecutionMode = (
-  value: RelationshipExecutionMode | string | undefined,
-  kind: RelationshipTask["kind"],
-): RelationshipExecutionMode => {
-  if (
-    value === "ask_user" ||
-    value === "collect_info" ||
-    value === "provide_info"
-  ) {
-    return value;
-  }
-  if (kind === "info_gathering") {
-    return "collect_info";
-  }
-  if (kind === "context_hint") {
-    return "provide_info";
-  }
-  return "ask_user";
-};
-
-const normalizePriority = (
-  value: RelationshipTask["priority"] | string | undefined,
-): RelationshipTask["priority"] => {
-  if (value === "high" || value === "medium" || value === "low") {
-    return value;
-  }
-  return "medium";
-};
-
 const buildEffectiveContextSummary = (
   recentSummary?: string,
   policySummary?: string,
@@ -479,9 +525,11 @@ const buildRecentFeedbackSummary = (turns: TurnRecord[]): string => {
   if (lines.length === 0) {
     return "";
   }
-  return ["Recent feedback-oriented conversation:", "Recent turns:", ...lines].join(
-    "\n",
-  );
+  return [
+    "Recent feedback-oriented conversation:",
+    "Recent turns:",
+    ...lines,
+  ].join("\n");
 };
 
 const buildRecentFeedbackSummaryWithLlm = async (
@@ -565,6 +613,7 @@ const learnInterventionPolicyState = async (input: {
   botId: string;
   threadId: string;
   now: Date;
+  minPolicyFlipIntervalMs: number;
   insights: RelationshipMemoryInsights;
   recentTurns: TurnRecord[];
   executionModeLearningTurns: TurnRecord[];
@@ -591,6 +640,8 @@ const learnInterventionPolicyState = async (input: {
     if (learned || preferredExecutionMode) {
       const stabilized = stabilizeInterventionPolicyState(
         input.insights,
+        input.now,
+        input.minPolicyFlipIntervalMs,
         input.currentPolicyState,
         {
           summary: learned?.summary ?? input.currentPolicyState?.summary ?? "",
@@ -640,6 +691,8 @@ const learnInterventionPolicyState = async (input: {
   }
   const stabilized = stabilizeInterventionPolicyState(
     input.insights,
+    input.now,
+    input.minPolicyFlipIntervalMs,
     input.currentPolicyState,
     {
       summary: heuristic?.summary ?? input.currentPolicyState?.summary ?? "",
@@ -686,7 +739,10 @@ const learnInterventionPolicyStateWithLlm = async (
   turns: TurnRecord[],
   currentPolicyState: RelationshipInterventionPolicyState | null,
   plannerModel: RelationshipPlanningModel,
-): Promise<Omit<RelationshipInterventionPolicyState, "botId" | "threadId" | "updatedAtIso"> | null> => {
+): Promise<Omit<
+  RelationshipInterventionPolicyState,
+  "botId" | "threadId" | "updatedAtIso"
+> | null> => {
   const lines = formatRecentTurns(turns, 10);
   if (lines.length === 0) {
     return null;
@@ -768,7 +824,10 @@ const learnInterventionPolicyStateHeuristically = (
   insights: RelationshipMemoryInsights,
   turns: TurnRecord[],
   currentPolicyState: RelationshipInterventionPolicyState | null,
-): Omit<RelationshipInterventionPolicyState, "botId" | "threadId" | "updatedAtIso"> | null => {
+): Omit<
+  RelationshipInterventionPolicyState,
+  "botId" | "threadId" | "updatedAtIso"
+> | null => {
   const userMessages = turns
     .flatMap((turn) => turn.messages)
     .filter((message) => message.role === "user")
@@ -801,26 +860,26 @@ const learnInterventionPolicyStateHeuristically = (
       : explicitSignals.avoidFeedbackQuestions === false
         ? "The user appears open to occasional feedback questions."
         : currentPolicyState?.avoidFeedbackQuestions
-        ? "The user still appears to prefer fewer feedback questions."
-        : "",
+          ? "The user still appears to prefer fewer feedback questions."
+          : "",
     explicitSignals.preferConcisePrompts === true
       ? "The user prefers concise prompts."
       : explicitSignals.preferConcisePrompts === false
         ? "The user appears comfortable with more detailed prompts."
         : currentPolicyState?.preferConcisePrompts
-        ? "The user still appears to prefer concise prompts."
-        : "",
+          ? "The user still appears to prefer concise prompts."
+          : "",
     explicitSignals.proactiveInfoPreference === "avoid"
       ? "Avoid proactive information unless clearly useful."
       : explicitSignals.proactiveInfoPreference === "allow"
         ? "Proactive information is welcome when useful."
-      : preferredExecutionMode === "ask_user"
-        ? "Direct user questions appear effective when needed."
-        : preferredExecutionMode === "provide_info"
-          ? "Brief proactive information appears effective."
-          : preferredExecutionMode === "collect_info"
-            ? "Background information collection appears effective."
-      : currentPolicyState?.summary ?? "",
+        : preferredExecutionMode === "ask_user"
+          ? "Direct user questions appear effective when needed."
+          : preferredExecutionMode === "provide_info"
+            ? "Brief proactive information appears effective."
+            : preferredExecutionMode === "collect_info"
+              ? "Background information collection appears effective."
+              : (currentPolicyState?.summary ?? ""),
   ].filter(Boolean);
 
   if (summaryParts.length === 0) {
@@ -864,21 +923,30 @@ const learnPreferredExecutionModeHeuristically = (
 
 const stabilizeInterventionPolicyState = (
   insights: RelationshipMemoryInsights,
+  now: Date,
+  minPolicyFlipIntervalMs: number,
   currentPolicyState: RelationshipInterventionPolicyState | null,
   candidate: Omit<
     RelationshipInterventionPolicyState,
     "botId" | "threadId" | "updatedAtIso"
   >,
   explicitSignals?: ExplicitPreferenceSignals,
-): Omit<RelationshipInterventionPolicyState, "botId" | "threadId" | "updatedAtIso"> => {
+): Omit<
+  RelationshipInterventionPolicyState,
+  "botId" | "threadId" | "updatedAtIso"
+> => {
   const stabilizedFocus = stabilizeInterventionFocus(
     candidate.interventionFocus,
     insights,
+    now,
+    minPolicyFlipIntervalMs,
     explicitSignals,
     currentPolicyState,
   );
   const preferredExecutionMode = stabilizePreferredExecutionMode(
     candidate.preferredExecutionMode,
+    now,
+    minPolicyFlipIntervalMs,
     explicitSignals,
     currentPolicyState,
   );
@@ -924,7 +992,10 @@ const applyInterventionPolicyState = (
   }
   const filtered = tasks
     .filter((task) => {
-      if (policyState.avoidFeedbackQuestions && task.kind === "feedback_prepare") {
+      if (
+        policyState.avoidFeedbackQuestions &&
+        task.kind === "feedback_prepare"
+      ) {
         return false;
       }
       if (
@@ -960,7 +1031,9 @@ const applyInterventionPolicyState = (
 const formatRecentTurns = (turns: TurnRecord[], limit: number = 8): string[] =>
   turns
     .flatMap((turn) => turn.messages)
-    .filter((message) => message.role === "user" || message.role === "assistant")
+    .filter(
+      (message) => message.role === "user" || message.role === "assistant",
+    )
     .map((message) => `[${message.role}] ${message.content.trim()}`)
     .filter((line) => line.length > 8)
     .slice(-limit);
@@ -997,12 +1070,11 @@ const detectExplicitPreferenceSignals = (
           )
         ? false
         : undefined;
-  const preferConcisePrompts =
-    /(shorter|短く|brief|簡潔|短め)/i.test(joined)
-      ? true
-      : /(詳しく|詳細|丁寧|長め|more detail|detailed)/i.test(joined)
-        ? false
-        : undefined;
+  const preferConcisePrompts = /(shorter|短く|brief|簡潔|短め)/i.test(joined)
+    ? true
+    : /(詳しく|詳細|丁寧|長め|more detail|detailed)/i.test(joined)
+      ? false
+      : undefined;
   const proactiveInfoPreference =
     /(not now|不要|いらない|later|今は.*不要)/i.test(joined)
       ? "avoid"
@@ -1034,16 +1106,27 @@ const detectExplicitPreferenceSignals = (
 const stabilizeInterventionFocus = (
   candidate: RelationshipInterventionFocus,
   insights: RelationshipMemoryInsights,
+  now: Date,
+  minPolicyFlipIntervalMs: number,
   explicitSignals: ExplicitPreferenceSignals | undefined,
   currentPolicyState: RelationshipInterventionPolicyState | null,
 ): RelationshipInterventionFocus => {
   if (explicitSignals?.relationshipFocusSignal) {
     return "relationship";
   }
-  if (insights.report.conflicts.length > 0 || insights.report.staleNotes.length > 0) {
+  if (
+    insights.report.conflicts.length > 0 ||
+    insights.report.staleNotes.length > 0
+  ) {
     return "memory";
   }
   if (currentPolicyState?.interventionFocus) {
+    if (
+      candidate !== currentPolicyState.interventionFocus &&
+      !isPolicyFlipAllowed(now, currentPolicyState, minPolicyFlipIntervalMs)
+    ) {
+      return currentPolicyState.interventionFocus;
+    }
     return currentPolicyState.interventionFocus;
   }
   return candidate;
@@ -1098,11 +1181,7 @@ const normalizeProactiveInfoPreference = (
 const normalizeInterventionFocus = (
   value: RelationshipInterventionFocus | string | undefined,
 ): RelationshipInterventionFocus => {
-  if (
-    value === "balanced" ||
-    value === "relationship" ||
-    value === "memory"
-  ) {
+  if (value === "balanced" || value === "relationship" || value === "memory") {
     return value;
   }
   return "balanced";
@@ -1130,7 +1209,10 @@ const decideInterventionFocusHeuristically = (
   if (explicitSignals.relationshipFocusSignal) {
     return "relationship";
   }
-  if (insights.report.conflicts.length > 0 || insights.report.staleNotes.length > 0) {
+  if (
+    insights.report.conflicts.length > 0 ||
+    insights.report.staleNotes.length > 0
+  ) {
     return "memory";
   }
   return currentPolicyState?.interventionFocus ?? "balanced";
@@ -1146,8 +1228,18 @@ const sortTasksByPolicyState = (
   }
   const order =
     focus === "relationship"
-      ? ["feedback_prepare", "context_hint", "memory_improvement", "info_gathering"]
-      : ["memory_improvement", "info_gathering", "context_hint", "feedback_prepare"];
+      ? [
+          "feedback_prepare",
+          "context_hint",
+          "memory_improvement",
+          "info_gathering",
+        ]
+      : [
+          "memory_improvement",
+          "info_gathering",
+          "context_hint",
+          "feedback_prepare",
+        ];
   return sortTasksByExecutionModePreference(
     [...tasks].sort(
       (left, right) => order.indexOf(left.kind) - order.indexOf(right.kind),
@@ -1161,26 +1253,36 @@ const sortTasksByExecutionModePreference = (
   policyState: RelationshipInterventionPolicyState,
 ): RelationshipTask[] => {
   const order = buildExecutionModeOrder(policyState);
-  return [...tasks].sort(
-    (left, right) =>
-      order.indexOf(left.executionMode) - order.indexOf(right.executionMode),
-  );
+  const preferredIndex =
+    policyState.preferredExecutionMode === "balanced"
+      ? -1
+      : order.indexOf(policyState.preferredExecutionMode);
+  return [...tasks].sort((left, right) => {
+    const leftRank = order.indexOf(left.executionMode);
+    const rightRank = order.indexOf(right.executionMode);
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    if (preferredIndex < 0) {
+      return 0;
+    }
+    const leftPreferred = left.executionMode === order[preferredIndex];
+    const rightPreferred = right.executionMode === order[preferredIndex];
+    if (leftPreferred === rightPreferred) {
+      return 0;
+    }
+    return leftPreferred ? -1 : 1;
+  });
 };
 
 const buildExecutionModeOrder = (
   policyState: RelationshipInterventionPolicyState,
 ): RelationshipExecutionMode[] => {
-  if (policyState.preferredExecutionMode !== "balanced") {
-    return [
-      policyState.preferredExecutionMode,
-      ...(["ask_user", "provide_info", "collect_info"] as RelationshipExecutionMode[]).filter(
-        (mode) => mode !== policyState.preferredExecutionMode,
-      ),
-    ];
-  }
+  // Hard guard: when feedback questions should be minimized, ask_user always trails.
   if (policyState.avoidFeedbackQuestions) {
     return ["provide_info", "collect_info", "ask_user"];
   }
+  // Focus drives the primary ordering; preferredExecutionMode is a tie-breaker.
   if (policyState.proactiveInfoPreference === "avoid") {
     return ["ask_user", "collect_info", "provide_info"];
   }
@@ -1195,6 +1297,8 @@ const buildExecutionModeOrder = (
 
 const stabilizePreferredExecutionMode = (
   candidate: RelationshipExecutionModePreference,
+  now: Date,
+  minPolicyFlipIntervalMs: number,
   explicitSignals: ExplicitPreferenceSignals | undefined,
   currentPolicyState: RelationshipInterventionPolicyState | null,
 ): RelationshipExecutionModePreference => {
@@ -1202,7 +1306,29 @@ const stabilizePreferredExecutionMode = (
     return explicitSignals.preferredExecutionMode;
   }
   if (candidate !== "balanced") {
+    if (
+      currentPolicyState?.preferredExecutionMode &&
+      candidate !== currentPolicyState.preferredExecutionMode &&
+      !isPolicyFlipAllowed(now, currentPolicyState, minPolicyFlipIntervalMs)
+    ) {
+      return currentPolicyState.preferredExecutionMode;
+    }
     return candidate;
   }
   return currentPolicyState?.preferredExecutionMode ?? "balanced";
+};
+
+const isPolicyFlipAllowed = (
+  now: Date,
+  currentPolicyState: RelationshipInterventionPolicyState,
+  minPolicyFlipIntervalMs: number,
+): boolean => {
+  if (minPolicyFlipIntervalMs <= 0) {
+    return true;
+  }
+  const lastUpdatedMs = Date.parse(currentPolicyState.updatedAtIso);
+  if (!Number.isFinite(lastUpdatedMs)) {
+    return true;
+  }
+  return now.getTime() - lastUpdatedMs >= minPolicyFlipIntervalMs;
 };

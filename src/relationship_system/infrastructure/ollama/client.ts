@@ -1,6 +1,8 @@
 import { RelationshipPlanningModel } from "../../domain/types";
 
-export class OllamaRelationshipPlanningClient implements RelationshipPlanningModel {
+export class OllamaRelationshipPlanningClient
+  implements RelationshipPlanningModel
+{
   constructor(
     private readonly baseUrl: string,
     private readonly model: string,
@@ -27,7 +29,9 @@ export class OllamaRelationshipPlanningClient implements RelationshipPlanningMod
     });
 
     if (!response.ok) {
-      throw new Error(`ollama relationship planning request failed: ${response.status}`);
+      throw new Error(
+        `ollama relationship planning request failed: ${response.status}`,
+      );
     }
 
     const data = (await response.json()) as {

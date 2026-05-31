@@ -11,7 +11,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx tests/service.test.ts && tsx tests/backgroundRunner.test.ts && tsx tests/adapter.test.ts && tsx tests/fileTurnRecordStore.test.ts && tsx tests/fileQueueBackgroundInputSink.test.ts && tsx tests/filePolicyStateStore.test.ts",
-    "start:background": "tsx src/cli/runBackground.ts"
+    "start:background": "tsx --env-file=.env.ao src/cli/runBackground.ts"
   },
   "dependencies": {
     "@chat-agent/memory-system": "file:../memory-system",

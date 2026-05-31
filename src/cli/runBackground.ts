@@ -45,6 +45,26 @@ const optionalNumber = (name: string, fallback: number): number => {
   return value;
 };
 
+const optionalUserScopeMissingMode = (
+  name: string,
+): "fallback_thread" | "skip_user_scope" => {
+  const raw = process.env[name];
+  if (raw === "skip_user_scope") {
+    return raw;
+  }
+  return "fallback_thread";
+};
+
+const optionalPolicyScopeMode = (
+  name: string,
+): "thread" | "user" | "hybrid" => {
+  const raw = process.env[name];
+  if (raw === "user" || raw === "hybrid") {
+    return raw;
+  }
+  return "thread";
+};
+
 const main = async (): Promise<void> => {
   const botId = process.env.BOT_ID ?? "ao";
   const pollMs = optionalNumber("RELATIONSHIP_BACKGROUND_POLL_MS", 60_000);
@@ -80,6 +100,12 @@ const main = async (): Promise<void> => {
   });
 
   const queueFilePath = required("RELATIONSHIP_QUEUE_FILE");
+  const policyScopeMode = optionalPolicyScopeMode(
+    "RELATIONSHIP_POLICY_SCOPE_MODE",
+  );
+  const userScopeMissingUserIdMode = optionalUserScopeMissingMode(
+    "RELATIONSHIP_USER_SCOPE_MISSING_USER_ID_MODE",
+  );
   const backgroundApp = createRelationshipBackgroundApp({
     botId,
     threadIds,
@@ -100,9 +126,19 @@ const main = async (): Promise<void> => {
       "RELATIONSHIP_EXECUTION_MODE_LEARNING_TURN_LIMIT",
       16,
     ),
+    dispatchSuppressionWindowMs: optionalNumber(
+      "RELATIONSHIP_DISPATCH_SUPPRESSION_WINDOW_MS",
+      2 * 60 * 60 * 1000,
+    ),
+    minTurnAgeMsBeforeLowPriorityDispatch: optionalNumber(
+      "RELATIONSHIP_MIN_TURN_AGE_MS_BEFORE_LOW_PRIORITY_DISPATCH",
+      10 * 60 * 1000,
+    ),
     policyStateStore: createFileRelationshipPolicyStateStore({
       baseDir: process.env.RELATIONSHIP_STORE_DIR ?? "data/relationship-system",
     }),
+    policyScopeMode,
+    userScopeMissingUserIdMode,
     memoryProvider: createMemorySystemRelationshipMemoryProvider(memoryService),
     backgroundInputSink: createFileQueueBackgroundInputSink({
       filePath: queueFilePath,
@@ -132,7 +168,7 @@ const main = async (): Promise<void> => {
   });
 
   process.stdout.write(
-    `[relationship-system] starting botId=${botId} threads=${threadIds.join(",")} pollMs=${pollMs}\n`,
+    `[relationship-system] starting botId=${botId} threads=${threadIds.join(",")} pollMs=${pollMs} scopeMode=${policyScopeMode} missingUserIdMode=${userScopeMissingUserIdMode}\n`,
   );
   backgroundApp.runner.start();
 
