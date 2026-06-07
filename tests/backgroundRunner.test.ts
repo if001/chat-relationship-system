@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
+import { test } from "vitest";
 import { createRelationshipBackgroundRunner } from "../src/relationship_system/api/backgroundRunner";
-
-const run = async (): Promise<void> => {
-  await testBackgroundRunnerDispatchesForEachThread();
-  await testBackgroundRunnerSkipsWhenShouldRunIsFalse();
-};
 
 const testBackgroundRunnerDispatchesForEachThread = async (): Promise<void> => {
   const calls: string[] = [];
@@ -47,4 +43,5 @@ const testBackgroundRunnerSkipsWhenShouldRunIsFalse = async (): Promise<void> =>
   assert.deepEqual(calls, []);
 };
 
-void run();
+test("background runner dispatches for each thread", testBackgroundRunnerDispatchesForEachThread);
+test("background runner skips when shouldRun is false", testBackgroundRunnerSkipsWhenShouldRunIsFalse);

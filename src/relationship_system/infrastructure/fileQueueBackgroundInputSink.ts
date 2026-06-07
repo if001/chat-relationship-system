@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { BackgroundInput, BackgroundInputSink } from "../domain/types";
 
@@ -32,6 +32,7 @@ export interface FileQueueBackgroundInputSinkOptions {
   channelId: string;
   authorId?: string;
   enqueueCooldownMs?: number;
+  debugLogFilePath?: string;
 }
 
 export const createFileQueueBackgroundInputSink = (
@@ -51,6 +52,11 @@ export const createFileQueueBackgroundInputSink = (
         lastEnqueuedAt !== undefined &&
         now - lastEnqueuedAt < enqueueCooldownMs
       ) {
+        await appendDebugLog(options.debugLogFilePath, {
+          event: "skipped_duplicate",
+          dedupeKey,
+          input,
+        });
         process.stdout.write(
           `[relationship-system] skipped duplicate threadId=${input.threadId} key=${dedupeKey}\n`,
         );
@@ -72,6 +78,11 @@ export const createFileQueueBackgroundInputSink = (
       });
       await writeQueueFile(options.filePath, items);
       lastEnqueuedAtBySourceUnitStep.set(dedupeKey, now);
+      await appendDebugLog(options.debugLogFilePath, {
+        event: "enqueued",
+        dedupeKey,
+        input,
+      });
       process.stdout.write(
         `[relationship-system] queued threadId=${input.threadId} key=${dedupeKey}\n`,
       );
@@ -124,4 +135,23 @@ const writeQueueFile = async (
 ): Promise<void> => {
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, JSON.stringify(items, null, 2), "utf8");
+};
+
+const appendDebugLog = async (
+  filePath: string | undefined,
+  payload: {
+    event: "enqueued" | "skipped_duplicate";
+    dedupeKey: string;
+    input: BackgroundInput;
+  },
+): Promise<void> => {
+  if (!filePath) {
+    return;
+  }
+  const row = JSON.stringify({
+    atIso: new Date().toISOString(),
+    ...payload,
+  });
+  await mkdir(dirname(filePath), { recursive: true });
+  await appendFile(filePath, `${row}\n`, "utf8");
 };

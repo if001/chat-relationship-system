@@ -1,14 +1,15 @@
-export interface RelationshipMemoryReport {
-  gaps: string[];
-  staleNotes: string[];
-  conflicts: string[];
+export interface RelationshipInsightReport {
+  clarificationCandidates: string[];
+  proactiveContextCandidates: string[];
+  repairCandidates: string[];
+  boundaryCandidates: string[];
   createdAtIso: string;
 }
 
 export interface RelationshipMemoryInsights {
   botId: string;
   threadId: string;
-  report: RelationshipMemoryReport;
+  report: RelationshipInsightReport;
   recentContextSummary?: string;
 }
 
@@ -26,11 +27,11 @@ export interface TurnRecord {
   createdAtIso: string;
 }
 
-export type RelationshipTaskKind =
-  | "feedback_prepare"
-  | "info_gathering"
-  | "context_hint"
-  | "memory_improvement";
+export type RelationshipWorkUnitKind =
+  | "preference_gap"
+  | "stale_context"
+  | "conflict_resolution"
+  | "memory_boundary";
 
 export type RelationshipPriority = "low" | "medium" | "high";
 export type RelationshipExecutionMode =
@@ -43,13 +44,19 @@ export type RelationshipExecutionModePreference =
   | "collect_info"
   | "provide_info";
 
+export type RelationshipWorkUnitStep =
+  | "organize"
+  | "intervene"
+  | "observe"
+  | "adjust";
+
 export interface RelationshipTask {
   id: string;
   unitId: string;
-  unitStep: "organize" | "intervene" | "observe" | "adjust";
+  unitStep: RelationshipWorkUnitStep;
   botId: string;
   threadId: string;
-  kind: RelationshipTaskKind;
+  kind: RelationshipWorkUnitKind;
   executionMode: RelationshipExecutionMode;
   title: string;
   purpose: string;
@@ -59,13 +66,38 @@ export interface RelationshipTask {
   createdAtIso: string;
 }
 
+export type RelationshipWorkUnitStatus =
+  | "internal_completed"
+  | "intervened"
+  | "waiting_for_response"
+  | "response_received"
+  | "no_signal";
+
+export interface RelationshipWorkUnitState {
+  unitId: string;
+  botId: string;
+  threadId: string;
+  kind: RelationshipWorkUnitKind;
+  title: string;
+  currentStep: RelationshipWorkUnitStep;
+  status: RelationshipWorkUnitStatus;
+  sourceSignals: string[];
+  organizeSummary?: string;
+  lastInterventionText?: string;
+  lastObservationPrompt?: string;
+  lastInterventionAtIso?: string;
+  responseWindowTurns?: number;
+  observedResponseText?: string;
+  updatedAtIso: string;
+}
+
 export interface BackgroundInput {
   botId: string;
   threadId: string;
   text: string;
   sourceTaskId: string;
   sourceUnitId?: string;
-  sourceUnitStep?: "organize" | "intervene" | "observe" | "adjust";
+  sourceUnitStep?: RelationshipWorkUnitStep;
 }
 
 export interface RelationshipPolicy {
@@ -122,4 +154,12 @@ export interface RelationshipPolicyStateStore {
     threadId: string;
   }): Promise<RelationshipInterventionPolicyState | null>;
   savePolicyState(state: RelationshipInterventionPolicyState): Promise<void>;
+}
+
+export interface RelationshipWorkUnitStateStore {
+  listWorkUnits(input: {
+    botId: string;
+    threadId: string;
+  }): Promise<RelationshipWorkUnitState[]>;
+  saveWorkUnit(state: RelationshipWorkUnitState): Promise<void>;
 }

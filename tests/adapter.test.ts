@@ -1,18 +1,16 @@
 import assert from "node:assert/strict";
+import { test } from "vitest";
 import { createMemorySystemRelationshipMemoryProvider } from "../src/relationship_system/adapters/memorySystemProvider";
-
-const run = async (): Promise<void> => {
-  await testMemorySystemAdapterMapsReport();
-};
 
 const testMemorySystemAdapterMapsReport = async (): Promise<void> => {
   const provider = createMemorySystemRelationshipMemoryProvider({
-    generateMemoryReport: async () => ({
+    generateRelationshipInsightReport: async () => ({
       botId: "ao",
       threadId: "thread-1",
-      gaps: ["gap-1"],
-      staleNotes: ["stale-1"],
-      conflicts: ["conflict-1"],
+      clarificationCandidates: ["gap-1"],
+      proactiveContextCandidates: ["stale-1"],
+      repairCandidates: ["conflict-1"],
+      boundaryCandidates: ["boundary-1"],
       createdAtIso: "2026-05-29T00:00:00.000Z",
     }),
     getRecentConversationContext: async () =>
@@ -25,12 +23,13 @@ const testMemorySystemAdapterMapsReport = async (): Promise<void> => {
   });
 
   assert.deepEqual(result.report, {
-    gaps: ["gap-1"],
-    staleNotes: ["stale-1"],
-    conflicts: ["conflict-1"],
+    clarificationCandidates: ["gap-1"],
+    proactiveContextCandidates: ["stale-1"],
+    repairCandidates: ["conflict-1"],
+    boundaryCandidates: ["boundary-1"],
     createdAtIso: "2026-05-29T00:00:00.000Z",
   });
   assert.match(result.recentContextSummary ?? "", /prefer concise follow-ups/);
 };
 
-void run();
+test("memory-system adapter maps report", testMemorySystemAdapterMapsReport);

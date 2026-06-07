@@ -2,11 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { test } from "vitest";
 import { createFileRelationshipPolicyStateStore } from "../src/relationship_system/infrastructure/filePolicyStateStore";
-
-const run = async (): Promise<void> => {
-  await testFilePolicyStateStoreSavesAndLoads();
-};
 
 const testFilePolicyStateStoreSavesAndLoads = async (): Promise<void> => {
   const dir = await mkdtemp(join(tmpdir(), "relationship-policy-"));
@@ -37,4 +34,4 @@ const testFilePolicyStateStoreSavesAndLoads = async (): Promise<void> => {
   }
 };
 
-void run();
+test("file policy state store saves and loads", testFilePolicyStateStoreSavesAndLoads);

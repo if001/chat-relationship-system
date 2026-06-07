@@ -1,241 +1,298 @@
 import assert from "node:assert/strict";
+import { test } from "vitest";
 import {
+  buildRecentFeedbackSummaryWithLlm,
   createRelationshipSystemService,
   planRelationshipTasks,
   planRelationshipTasksWithLlm,
+  summarizeOrganizeTaskWithLlm,
 } from "../src/relationship_system/api/service";
 import {
   BackgroundInput,
   RelationshipInterventionPolicyState,
   RelationshipMemoryInsights,
+  RelationshipPlanningModel,
   RelationshipPolicyStateStore,
   RelationshipTurnRecordStore,
+  RelationshipWorkUnitKind,
+  RelationshipWorkUnitState,
+  RelationshipWorkUnitStateStore,
   TurnRecord,
 } from "../src/relationship_system/domain/types";
 
-const run = async (): Promise<void> => {
-  await testPlanRelationshipTasksCreatesExpectedTasks();
-  await testPlanRelationshipTasksWithLlmUsesFeedbackAndMemoryImprovement();
-  await testDispatchTasksEnqueuesLimitedBackgroundInputs();
-  await testDispatchSuppressesWhenReportAndTaskAreUnchanged();
-  await testDispatchSuppressesLowPrioritySameKindWithinWindow();
-  await testDispatchDoesNotSuppressHighPriorityDuplicates();
-  await testDispatchSuppressesLowPriorityWhenRecentTurnIsTooFresh();
-  await testDispatchIncludesWorkUnitMetadata();
-  await testDispatchDoesNotSuppressDifferentWorkUnitsWithinWindow();
-  await testIngestTurnRecordAppendsToStore();
-  await testPlanTasksUsesRecentTurnFeedbackSummary();
-  await testPlanTasksUsesLlmFeedbackExtractionBeforePlanning();
-  await testPolicyLearningSuppressesFeedbackQuestions();
-  await testPolicyLearningAddsConcisePromptHint();
-  await testHeuristicPlanningAddsMemoryImprovementTask();
-  await testPolicyLearningPrefersMemoryInterventions();
-  await testPolicyLearningSuppressesInfoGatheringWhenUserRejectsProactiveInfo();
-  await testQuestionAvoidanceDeprioritizesAskUserTasks();
-  await testConcisePreferenceAlsoShortensProvideInfoTasks();
-  await testDetailedPreferenceRelaxesConcisePromptPolicy();
-  await testProactiveInfoWelcomeRelaxesAvoidPolicy();
-  await testFocusRemainsStableWithoutStrongNewSignal();
-  await testPreferredExecutionModePersistsWithoutNewSignal();
-  await testPreferredExecutionModeCanShiftToProvideInfo();
-  await testPolicyLearningUsesLongerWindowThanRecentSummary();
-  await testExecutionModeLearningUsesItsOwnLongerWindow();
-  await testFocusTakesPriorityOverPreferredExecutionMode();
-  await testAskUserSuppressionOverridesPreferredExecutionMode();
-  await testUserScopeSharesPolicyAcrossThreads();
-  await testHybridScopePrefersThreadOverride();
-  await testUserScopeUsesExplicitUserIdResolver();
-  await testUserScopeFallsBackToThreadWhenUserKeyMissing();
-  await testUserScopeSkipsWhenUserKeyMissingAndSkipModeEnabled();
-  await testHybridScopeMergesWithThreadFieldPriority();
-};
-
-const testPlanRelationshipTasksCreatesExpectedTasks = async (): Promise<void> => {
+const testPlanRelationshipTasksCreatesOrganizeSteps = async (): Promise<void> => {
   const tasks = planRelationshipTasks(
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      report: {
-        gaps: ["The user's preferred proactive frequency is unknown."],
-        staleNotes: ["Policy card is stale: pc-1"],
-        conflicts: ["Conflicting recommended behavior detected for title: implementation support"],
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-      },
-    },
-    {
-      proactiveHelpLevel: "medium",
-      askForFeedbackSparingly: true,
-      maxBackgroundInputsPerRun: 1,
-    },
+    createInsights({
+      clarificationCandidates: [
+        "The user's preferred proactive frequency is unknown.",
+      ],
+      proactiveContextCandidates: ["Share the latest implementation constraint."],
+      repairCandidates: [
+        "The assistant recently mismatched implementation framing.",
+      ],
+      boundaryCandidates: ["Clarify implementation support vs research framing."],
+    }),
+    defaultPolicy(),
     new Date("2026-05-29T00:00:00.000Z"),
   );
 
   assert.deepEqual(
     tasks.map((task) => task.kind),
-    ["feedback_prepare", "info_gathering", "context_hint", "memory_improvement"],
+    ["preference_gap", "stale_context", "conflict_resolution", "memory_boundary"],
   );
-  assert.deepEqual(
-    tasks.map((task) => task.executionMode),
-    ["ask_user", "collect_info", "provide_info", "ask_user"],
-  );
-  assert.match(tasks[0]?.inputText ?? "", /clarification/);
+  assert.deepEqual(tasks.map((task) => task.unitStep), ["organize", "organize", "organize", "organize"]);
+  assert.deepEqual(tasks.map((task) => task.executionMode), ["collect_info", "collect_info", "collect_info", "collect_info"]);
 };
 
-const testDispatchTasksEnqueuesLimitedBackgroundInputs = async (): Promise<void> => {
-  const enqueued: BackgroundInput[] = [];
-  const insights: RelationshipMemoryInsights = {
-    botId: "ao",
-    threadId: "thread-1",
-    report: {
-      gaps: ["Unknown preference."],
-      staleNotes: ["Policy card is stale: pc-1"],
-      conflicts: [],
-      createdAtIso: "2026-05-29T00:00:00.000Z",
+const testPlanRelationshipTasksWithLlmFallsBackToHeuristic = async (): Promise<void> => {
+  const plannerModel: RelationshipPlanningModel = {
+    generateJson: async () => ({ tasks: [] }),
+  };
+  const tasks = await planRelationshipTasksWithLlm(
+    createInsights({
+      clarificationCandidates: ["Unknown preference."],
+      repairCandidates: ["Mismatch"],
+    }),
+    defaultPolicy(),
+    new Date("2026-05-29T00:00:00.000Z"),
+    plannerModel,
+  );
+
+  assert.equal(tasks[0]?.unitStep, "organize");
+  assert.equal(tasks[0]?.kind, "preference_gap");
+};
+
+const testPlanRelationshipTasksWithLlmExplainsInputAndOutputSchema = async (): Promise<void> => {
+  const calls: Array<{ systemPrompt: string; userPrompt: string }> = [];
+  const plannerModel: RelationshipPlanningModel = {
+    generateJson: async (systemPrompt, userPrompt) => {
+      calls.push({ systemPrompt, userPrompt });
+      return { tasks: [] };
     },
   };
 
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore(),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => insights,
-    },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-      proactiveHelpLevel: "high",
-    },
-    now: () => new Date("2026-05-29T00:00:00.000Z"),
-  });
+  await planRelationshipTasksWithLlm(
+    createInsights({
+      clarificationCandidates: ["Unknown preference."],
+      repairCandidates: ["Mismatch"],
+    }),
+    defaultPolicy(),
+    new Date("2026-05-29T00:00:00.000Z"),
+    plannerModel,
+  );
 
-  const result = await service.dispatchTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
-  assert.equal(result.length, 1);
-  assert.equal(enqueued.length, 1);
-  assert.equal(enqueued[0]?.sourceTaskId, result[0]?.sourceTaskId);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.systemPrompt, /relationshipInsightReport の意味:/);
+  assert.match(calls[0]!.systemPrompt, /kind に使える値は厳密に次の 4 つだけです/);
+  assert.match(calls[0]!.systemPrompt, /unitStep に使える値は厳密に次の 3 つだけです/);
+  assert.match(calls[0]!.systemPrompt, /executionMode に使える値は厳密に次の 3 つだけです/);
+  assert.match(calls[0]!.userPrompt, /"relationshipInsightReport":/);
+  assert.match(calls[0]!.userPrompt, /"existingWorkUnits":/);
+  assert.match(calls[0]!.userPrompt, /"heuristicPlan":/);
+  assert.match(calls[0]!.userPrompt, /kind: one of preference_gap/);
+  assert.doesNotMatch(calls[0]!.userPrompt, /"botId":/);
+  assert.doesNotMatch(calls[0]!.userPrompt, /"threadId":/);
+  assert.doesNotMatch(calls[0]!.userPrompt, /"createdAtIso":/);
+  assert.doesNotMatch(calls[0]!.userPrompt, /"id":/);
 };
 
-const testDispatchSuppressesWhenReportAndTaskAreUnchanged = async (): Promise<void> => {
-  const enqueued: BackgroundInput[] = [];
-  const insights: RelationshipMemoryInsights = {
-    botId: "ao",
-    threadId: "thread-1",
-    report: {
-      gaps: ["Unknown preference."],
-      staleNotes: [],
-      conflicts: [],
-      createdAtIso: "2026-05-29T00:00:00.000Z",
+const testPlanRelationshipTasksWithLlmSkipsLlmWhenBaseTasksAreEmpty = async (): Promise<void> => {
+  let called = false;
+  const plannerModel: RelationshipPlanningModel = {
+    generateJson: async () => {
+      called = true;
+      return { tasks: [] };
     },
   };
 
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore(),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => insights,
-    },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-    },
-    now: () => new Date("2026-05-29T00:00:00.000Z"),
-  });
+  const tasks = await planRelationshipTasksWithLlm(
+    createInsights({}),
+    defaultPolicy(),
+    new Date("2026-05-29T00:00:00.000Z"),
+    plannerModel,
+  );
 
-  const first = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  const second = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(first.length, 1);
-  assert.equal(second.length, 0);
-  assert.equal(enqueued.length, 1);
+  assert.deepEqual(tasks, []);
+  assert.equal(called, false);
 };
 
-const testDispatchSuppressesLowPrioritySameKindWithinWindow = async (): Promise<void> => {
-  const enqueued: BackgroundInput[] = [];
-  let currentTime = new Date("2026-05-29T00:00:00.000Z");
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore(),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
+const testBuildRecentFeedbackSummaryWithLlmExplainsSchemaAndPassesMinimalFields =
+  async (): Promise<void> => {
+    const calls: Array<{ systemPrompt: string; userPrompt: string }> = [];
+    const plannerModel: RelationshipPlanningModel = {
+      generateJson: async (systemPrompt, userPrompt) => {
+        calls.push({ systemPrompt, userPrompt });
+        return { summary: "The user wants fewer confirmation prompts.", signals: ["too many confirmations"] };
+      },
+    };
+
+    const summary = await buildRecentFeedbackSummaryWithLlm(
+      [
+        assistantTurn("ao", "thread-1", "2026-05-29T00:00:00.000Z", "最近の確認頻度はどうですか。"),
+        userTurn("ao", "thread-1", "2026-05-29T00:01:00.000Z", "少し多いです"),
+      ],
+      plannerModel,
+    );
+
+    assert.match(summary, /The user wants fewer confirmation prompts/);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!.systemPrompt, /recentTurns には assistant と user の message だけが時系列順で入っています/);
+    assert.match(calls[0]!.userPrompt, /"recentTurns":/);
+    assert.match(calls[0]!.userPrompt, /signals/);
+    assert.doesNotMatch(calls[0]!.userPrompt, /fallbackHeuristicSummary/);
+  };
+
+const testBuildRecentFeedbackSummaryWithLlmSkipsLlmWithoutFeedbackProbe =
+  async (): Promise<void> => {
+    let called = false;
+    const plannerModel: RelationshipPlanningModel = {
+      generateJson: async () => {
+        called = true;
+        return { summary: "unused" };
+      },
+    };
+
+    const summary = await buildRecentFeedbackSummaryWithLlm(
+      [
+        assistantTurn("ao", "thread-1", "2026-05-29T00:00:00.000Z", "実装を進めます。"),
+        userTurn("ao", "thread-1", "2026-05-29T00:01:00.000Z", "お願いします"),
+      ],
+      plannerModel,
+    );
+
+    assert.match(summary, /Recent feedback-oriented conversation:/);
+    assert.equal(called, false);
+  };
+
+const testSummarizeOrganizeTaskWithLlmExplainsSchemaAndPassesMinimalFields =
+  async (): Promise<void> => {
+    const calls: Array<{ systemPrompt: string; userPrompt: string }> = [];
+    const plannerModel: RelationshipPlanningModel = {
+      generateJson: async (systemPrompt, userPrompt) => {
+        calls.push({ systemPrompt, userPrompt });
+        return { summary: "次回は好みを一つだけ確認する。" };
+      },
+    };
+
+    const summary = await summarizeOrganizeTaskWithLlm(
+      {
+        id: "task-1",
+        unitId: "unit-1",
+        unitStep: "organize",
         botId: "ao",
         threadId: "thread-1",
-        report: {
-          gaps: [],
-          staleNotes:
-            currentTime.getTime() < new Date("2026-05-29T01:00:00.000Z").getTime()
-              ? ["Policy card is stale: pc-1"]
-              : ["Policy card is stale: pc-2"],
-          conflicts: [],
-          createdAtIso: currentTime.toISOString(),
-        },
-      }),
-    },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
+        kind: "preference_gap",
+        executionMode: "collect_info",
+        title: "Clarify one user preference",
+        purpose: "Prepare one concrete preference clarification.",
+        inputText: "Organize the context for Clarify one user preference: Unknown preference.",
+        priority: "medium",
+        sourceSignals: ["Unknown preference.", "The user's proactive frequency is unknown."],
+        createdAtIso: "2026-05-29T00:00:00.000Z",
       },
+      plannerModel,
+    );
+
+    assert.equal(summary, "次回は好みを一つだけ確認する。");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!.systemPrompt, /organizeStep には、完了した内部 organize step についての最小情報だけが入っています/);
+    assert.match(calls[0]!.userPrompt, /"organizeStep":/);
+    assert.doesNotMatch(calls[0]!.userPrompt, /"id":/);
+    assert.doesNotMatch(calls[0]!.userPrompt, /"botId":/);
+    assert.doesNotMatch(calls[0]!.userPrompt, /"threadId":/);
+    assert.doesNotMatch(calls[0]!.userPrompt, /"createdAtIso":/);
+  };
+
+const testSummarizeOrganizeTaskWithLlmSkipsLlmForSimpleSingleSignalTask =
+  async (): Promise<void> => {
+    let called = false;
+    const plannerModel: RelationshipPlanningModel = {
+      generateJson: async () => {
+        called = true;
+        return { summary: "unused" };
+      },
+    };
+
+    const summary = await summarizeOrganizeTaskWithLlm(
+      {
+        id: "task-1",
+        unitId: "unit-1",
+        unitStep: "organize",
+        botId: "ao",
+        threadId: "thread-1",
+        kind: "preference_gap",
+        executionMode: "collect_info",
+        title: "Clarify one user preference",
+        purpose: "Prepare one concrete preference clarification.",
+        inputText: "Organize the context for Clarify one user preference: Unknown preference.",
+        priority: "medium",
+        sourceSignals: ["Unknown preference."],
+        createdAtIso: "2026-05-29T00:00:00.000Z",
+      },
+      plannerModel,
+    );
+
+    assert.match(summary, /次回はユーザーに一つだけ具体的な好みを確認する/);
+    assert.equal(called, false);
+  };
+
+const testDispatchExecutesOrganizeThenIntervenes = async (): Promise<void> => {
+  const enqueued: BackgroundInput[] = [];
+  const service = createRelationshipSystemService({
+    turnRecordStore: createInMemoryTurnRecordStore(),
+    policyStateStore: createInMemoryPolicyStateStore(),
+    memoryProvider: {
+      getInsights: async () =>
+        createInsights({ clarificationCandidates: ["Unknown preference."] }),
     },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-      proactiveHelpLevel: "medium",
-      askForFeedbackSparingly: false,
+    backgroundInputSink: { enqueue: async (input) => enqueued.push(input) },
+    now: () => new Date("2026-05-29T00:00:00.000Z"),
+  });
+
+  const dispatched = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
+
+  assert.equal(dispatched.length, 1);
+  assert.equal(enqueued.length, 1);
+  assert.equal(dispatched[0]?.sourceUnitStep, "intervene");
+  assert.match(dispatched[0]?.text ?? "", /確認です。/);
+};
+
+const testDispatchSuppressesDuplicateIntervention = async (): Promise<void> => {
+  const enqueued: BackgroundInput[] = [];
+  const service = createRelationshipSystemService({
+    turnRecordStore: createInMemoryTurnRecordStore(),
+    policyStateStore: createInMemoryPolicyStateStore(),
+    memoryProvider: {
+      getInsights: async () =>
+        createInsights({ clarificationCandidates: ["Unknown preference."] }),
     },
-    dispatchSuppressionWindowMs: 60 * 60 * 1000,
-    now: () => currentTime,
+    backgroundInputSink: { enqueue: async (input) => enqueued.push(input) },
+    now: () => new Date("2026-05-29T00:00:00.000Z"),
   });
 
   const first = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  currentTime = new Date("2026-05-29T00:10:00.000Z");
   const second = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  currentTime = new Date("2026-05-29T02:10:00.000Z");
-  const third = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
 
   assert.equal(first.length, 1);
   assert.equal(second.length, 0);
-  assert.equal(third.length, 1);
-  assert.equal(enqueued.length, 2);
+  assert.equal(enqueued.length, 1);
 };
 
-const testDispatchDoesNotSuppressHighPriorityDuplicates = async (): Promise<void> => {
+const testHighPriorityConflictCanRepeat = async (): Promise<void> => {
   const enqueued: BackgroundInput[] = [];
-  const insights: RelationshipMemoryInsights = {
-    botId: "ao",
-    threadId: "thread-1",
-    report: {
-      gaps: [],
-      staleNotes: [],
-      conflicts: ["Conflicting recommended behavior detected for implementation support."],
-      createdAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  };
   let currentTime = new Date("2026-05-29T00:00:00.000Z");
   const service = createRelationshipSystemService({
     turnRecordStore: createInMemoryTurnRecordStore(),
     policyStateStore: createInMemoryPolicyStateStore(),
     memoryProvider: {
-      getInsights: async () => insights,
+      getInsights: async () =>
+        createInsights({
+          repairCandidates: [
+            "Conflicting recommended behavior detected for implementation support.",
+          ],
+        }),
     },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-      askForFeedbackSparingly: false,
-      proactiveHelpLevel: "low",
-    },
+    backgroundInputSink: { enqueue: async (input) => enqueued.push(input) },
     dispatchSuppressionWindowMs: 60 * 60 * 1000,
     now: () => currentTime,
   });
@@ -246,1436 +303,397 @@ const testDispatchDoesNotSuppressHighPriorityDuplicates = async (): Promise<void
 
   assert.equal(first.length, 1);
   assert.equal(second.length, 1);
-  assert.equal(first[0]?.sourceTaskId, second[0]?.sourceTaskId);
   assert.equal(enqueued.length, 2);
 };
 
-const testDispatchSuppressesLowPriorityWhenRecentTurnIsTooFresh = async (): Promise<void> => {
-  const enqueued: BackgroundInput[] = [];
-  let currentTime = new Date("2026-05-29T00:00:00.000Z");
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: currentTime.toISOString(),
-        },
-      }),
-    },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-      askForFeedbackSparingly: true,
-      proactiveHelpLevel: "low",
-    },
-    minTurnAgeMsBeforeLowPriorityDispatch: 60 * 1000,
-    now: () => currentTime,
-  });
-
-  const first = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  currentTime = new Date("2026-05-29T00:02:00.000Z");
-  const second = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(first.length, 0);
-  assert.equal(second.length, 1);
-  assert.equal(enqueued.length, 1);
-};
-
-const testDispatchIncludesWorkUnitMetadata = async (): Promise<void> => {
+const testQueueBacklogSuppressesDispatch = async (): Promise<void> => {
   const enqueued: BackgroundInput[] = [];
   const service = createRelationshipSystemService({
     turnRecordStore: createInMemoryTurnRecordStore(),
     policyStateStore: createInMemoryPolicyStateStore(),
     memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+      getInsights: async () =>
+        createInsights({ clarificationCandidates: ["Unknown preference."] }),
     },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
+    backgroundInputSink: { enqueue: async (input) => enqueued.push(input) },
+    queueStatusProvider: async () => ({ locked: 0, readyUser: 1, readyScheduled: 0 }),
     now: () => new Date("2026-05-29T00:00:00.000Z"),
   });
 
-  const result = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  assert.equal(result.length, 1);
-  assert.equal(enqueued.length, 1);
-  assert.ok(result[0]?.sourceUnitId);
-  assert.equal(result[0]?.sourceUnitStep, "intervene");
+  const dispatched = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
+  assert.equal(dispatched.length, 0);
+  assert.equal(enqueued.length, 0);
 };
 
-const testDispatchDoesNotSuppressDifferentWorkUnitsWithinWindow = async (): Promise<void> => {
+const testSecondDispatchCreatesObserveStep = async (): Promise<void> => {
+  const workUnitStore = createInMemoryWorkUnitStateStore();
   const enqueued: BackgroundInput[] = [];
-  let currentTime = new Date("2026-05-29T00:00:00.000Z");
-  let stale = "Policy card is stale: pc-1";
   const service = createRelationshipSystemService({
     turnRecordStore: createInMemoryTurnRecordStore(),
     policyStateStore: createInMemoryPolicyStateStore(),
+    workUnitStateStore: workUnitStore,
     memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: [],
-          staleNotes: [stale],
-          conflicts: [],
-          createdAtIso: currentTime.toISOString(),
-        },
-      }),
+      getInsights: async () =>
+        createInsights({
+          proactiveContextCandidates: ["Policy card is stale: pc-1"],
+        }),
     },
-    backgroundInputSink: {
-      enqueue: async (input) => {
-        enqueued.push(input);
-      },
-    },
-    policy: {
-      maxBackgroundInputsPerRun: 1,
-      askForFeedbackSparingly: false,
-      proactiveHelpLevel: "medium",
-    },
-    dispatchSuppressionWindowMs: 60 * 60 * 1000,
-    now: () => currentTime,
+    backgroundInputSink: { enqueue: async (input) => enqueued.push(input) },
+    now: () => new Date("2026-05-29T00:00:00.000Z"),
   });
 
   const first = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
-  currentTime = new Date("2026-05-29T00:10:00.000Z");
-  stale = "Policy card is stale: pc-2";
   const second = await service.dispatchTasks({ botId: "ao", threadId: "thread-1" });
+  const units = await workUnitStore.listWorkUnits({ botId: "ao", threadId: "thread-1" });
 
-  assert.equal(first.length, 1);
-  assert.equal(second.length, 1);
-  assert.notEqual(first[0]?.sourceUnitId, second[0]?.sourceUnitId);
+  assert.equal(first[0]?.sourceUnitStep, "intervene");
+  assert.equal(second[0]?.sourceUnitStep, "observe");
+  assert.equal(units[0]?.currentStep, "observe");
+  assert.equal(units[0]?.status, "waiting_for_response");
+  assert.match(units[0]?.lastObservationPrompt ?? "", /頻度/);
 };
 
-const testIngestTurnRecordAppendsToStore = async (): Promise<void> => {
-  const store = createInMemoryTurnRecordStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: store,
-    policyStateStore: createInMemoryPolicyStateStore(),
-  });
-
-  await service.ingestTurnRecord({
-    botId: "ao",
-    threadId: "thread-1",
-    createdAtIso: "2026-05-29T00:00:00.000Z",
-    messages: [
-      {
-        role: "user",
-        content: "こんにちは",
-        timestampIso: "2026-05-29T00:00:00.000Z",
-      },
-    ],
-  });
-
-  const saved = await store.listRecentTurnRecords({
-    botId: "ao",
-    threadId: "thread-1",
-    limit: 5,
-  });
-  assert.equal(saved.length, 1);
-  assert.equal(saved[0]?.messages[0]?.content, "こんにちは");
-};
-
-const testPlanRelationshipTasksWithLlmUsesFeedbackAndMemoryImprovement = async (): Promise<void> => {
-  const tasks = await planRelationshipTasksWithLlm(
+const testUnrelatedUserReplyDoesNotCountAsObservationResponse = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const unitId = buildUnitIdLike("ao", "thread-1", "stale_context", source);
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId,
       botId: "ao",
       threadId: "thread-1",
-      recentContextSummary:
-        "Recent conversation history:\nRecent turn 1\n[user] You ask too many follow-up questions.",
-      report: {
-        gaps: ["The user's preferred proactive frequency is unknown."],
-        staleNotes: [],
-        conflicts: ["Conflicting recommended behavior detected for title: implementation support"],
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-      },
-    },
-    {
-      proactiveHelpLevel: "medium",
-      askForFeedbackSparingly: true,
-      maxBackgroundInputsPerRun: 2,
-    },
-    new Date("2026-05-29T00:00:00.000Z"),
-    {
-      generateJson: async () => ({
-        tasks: [
-          {
-            kind: "feedback_prepare",
-            title: "Ask one preference question",
-            purpose: "Clarify how often proactive follow-ups are welcome.",
-            inputText: "Next time, ask one short question about preferred follow-up frequency.",
-            priority: "medium",
-            sourceSignals: ["The user's preferred proactive frequency is unknown."],
-          },
-          {
-            kind: "memory_improvement",
-            title: "Clarify conflict boundary",
-            purpose: "Help memory-system separate conflicting response modes.",
-            inputText: "When this topic returns, confirm whether the user wants concrete implementation guidance or research framing.",
-            priority: "high",
-            sourceSignals: ["Conflicting recommended behavior detected for title: implementation support"],
-          },
-        ],
-      }),
-    },
-  );
-
-  assert.deepEqual(
-    tasks.map((task) => task.kind),
-    ["feedback_prepare", "memory_improvement"],
-  );
-  assert.match(tasks[1]?.purpose ?? "", /memory-system/i);
-};
-
-const testPlanTasksUsesRecentTurnFeedbackSummary = async (): Promise<void> => {
-  let capturedPrompt = "";
-  const store = createInMemoryTurnRecordStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      createdAtIso: "2026-05-29T00:00:00.000Z",
-      messages: [
-        {
-          role: "assistant",
-          content: "詳しく説明します。",
-          timestampIso: "2026-05-29T00:00:00.000Z",
-        },
-        {
-          role: "user",
-          content: "もう少し短くお願いします。",
-          timestampIso: "2026-05-29T00:00:10.000Z",
-        },
-      ],
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "observe",
+      status: "waiting_for_response",
+      sourceSignals: [source],
+      lastInterventionAtIso: "2026-05-29T00:00:00.000Z",
+      lastObservationPrompt: "最近の確認や補足の頻度、または情報の出し方はちょうどよかったですか。",
+      responseWindowTurns: 2,
+      updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
   ]);
-
+  const turnStore = createInMemoryTurnRecordStore([
+    assistantTurn("ao", "thread-1", "2026-05-29T00:00:00.000Z", "最近の確認や補足の頻度、または情報の出し方はちょうどよかったですか。"),
+  ]);
   const service = createRelationshipSystemService({
-    turnRecordStore: store,
+    turnRecordStore: turnStore,
     policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-    backgroundInputSink: {
-      enqueue: async () => {},
-    },
-    plannerModel: {
-      generateJson: async (_systemPrompt, userPrompt) => {
-        capturedPrompt = userPrompt;
-        return { tasks: [] };
-      },
-    },
+    workUnitStateStore: workUnitStore,
   });
 
-  await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
+  await service.ingestTurnRecord(userTurn("ao", "thread-1", "2026-05-29T00:01:00.000Z", "ところで次の実装ですが"));
+  await service.ingestTurnRecord(assistantTurn("ao", "thread-1", "2026-05-29T00:02:00.000Z", "了解です"));
+  const units = await workUnitStore.listWorkUnits({ botId: "ao", threadId: "thread-1" });
 
-  assert.match(capturedPrompt, /Recent feedback-oriented conversation/);
-  assert.match(capturedPrompt, /もう少し短くお願いします/);
+  assert.equal(units[0]?.status, "no_signal");
 };
 
-const testPlanTasksUsesLlmFeedbackExtractionBeforePlanning = async (): Promise<void> => {
-  const prompts: string[] = [];
-  const store = createInMemoryTurnRecordStore([
+const testFeedbackLikeReplyUpdatesObservation = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const unitId = buildUnitIdLike("ao", "thread-1", "stale_context", source);
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId,
       botId: "ao",
       threadId: "thread-1",
-      createdAtIso: "2026-05-29T00:00:00.000Z",
-      messages: [
-        {
-          role: "assistant",
-          content: "次からどれくらい詳しさが欲しいですか？",
-          timestampIso: "2026-05-29T00:00:00.000Z",
-        },
-        {
-          role: "user",
-          content: "次からは短めで大丈夫です。",
-          timestampIso: "2026-05-29T00:00:10.000Z",
-        },
-      ],
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "observe",
+      status: "waiting_for_response",
+      sourceSignals: [source],
+      lastInterventionAtIso: "2026-05-29T00:00:00.000Z",
+      lastObservationPrompt: "最近の確認や補足の頻度、または情報の出し方はちょうどよかったですか。",
+      responseWindowTurns: 2,
+      updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
   ]);
-
+  const turnStore = createInMemoryTurnRecordStore([
+    assistantTurn("ao", "thread-1", "2026-05-29T00:00:00.000Z", "最近の確認や補足の頻度、または情報の出し方はちょうどよかったですか。"),
+  ]);
   const service = createRelationshipSystemService({
-    turnRecordStore: store,
+    turnRecordStore: turnStore,
     policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-    backgroundInputSink: {
-      enqueue: async () => {},
-    },
-    plannerModel: {
-      generateJson: async (_systemPrompt, userPrompt) => {
-        prompts.push(userPrompt);
-        if (prompts.length === 1) {
-          return {
-            summary:
-              "The user prefers shorter follow-ups after being asked directly.",
-            interventionFocus: "relationship",
-            avoidFeedbackQuestions: false,
-            preferConcisePrompts: true,
-            proactiveInfoPreference: "unknown",
-          };
-        }
-        if (prompts.length === 2) {
-          return {
-            preferredExecutionMode: "ask_user",
-          };
-        }
-        if (prompts.length === 3) {
-          return {
-            summary:
-              "The user prefers shorter follow-ups after being asked directly.",
-            signals: ["prefers concise follow-ups"],
-          };
-        }
-        return {
-          tasks: [
-            {
-              kind: "feedback_prepare",
-              title: "Keep follow-up concise",
-              purpose: "Apply the newly clarified preference.",
-              inputText: "When following up, keep the question short.",
-              priority: "medium",
-              sourceSignals: ["prefers concise follow-ups"],
-            },
-          ],
-        };
-      },
-    },
+    workUnitStateStore: workUnitStore,
   });
 
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
+  await service.ingestTurnRecord(userTurn("ao", "thread-1", "2026-05-29T00:01:00.000Z", "少し多いです。"));
+  const units = await workUnitStore.listWorkUnits({ botId: "ao", threadId: "thread-1" });
 
-  assert.equal(prompts.length, 4);
-  assert.match(prompts[0] ?? "", /次からどれくらい詳しさが欲しいですか/);
-  assert.match(
-    prompts[1] ?? "",
-    /次からどれくらい詳しさが欲しいですか/,
-  );
-  assert.match(
-    prompts[2] ?? "",
-    /次からどれくらい詳しさが欲しいですか/,
-  );
-  assert.match(
-    prompts[3] ?? "",
-    /The user prefers shorter follow-ups after being asked directly/,
-  );
-  assert.equal(tasks[0]?.kind, "feedback_prepare");
+  assert.equal(units[0]?.status, "response_received");
+  assert.equal(units[0]?.observedResponseText, "少し多いです。");
 };
 
-const testPolicyLearningSuppressesFeedbackQuestions = async (): Promise<void> => {
-  const store = createInMemoryTurnRecordStore([
+const testPlanTasksSkipsWaitingObserveUnit = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId: buildUnitIdLike("ao", "thread-1", "stale_context", source),
       botId: "ao",
       threadId: "thread-1",
-      createdAtIso: "2026-05-29T00:00:00.000Z",
-      messages: [
-        {
-          role: "assistant",
-          content: "次に確認してもよいですか？",
-          timestampIso: "2026-05-29T00:00:00.000Z",
-        },
-        {
-          role: "user",
-          content: "質問は多すぎるので減らしてください。",
-          timestampIso: "2026-05-29T00:00:10.000Z",
-        },
-      ],
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "observe",
+      status: "waiting_for_response",
+      sourceSignals: [source],
+      updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
   ]);
-  const policyStore = createInMemoryPolicyStateStore();
   const service = createRelationshipSystemService({
-    turnRecordStore: store,
-    policyStateStore: policyStore,
+    turnRecordStore: createInMemoryTurnRecordStore(),
+    policyStateStore: createInMemoryPolicyStateStore(),
+    workUnitStateStore: workUnitStore,
     memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+      getInsights: async () =>
+        createInsights({ proactiveContextCandidates: [source] }),
     },
   });
 
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-  const saved = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
+  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
   assert.equal(tasks.length, 0);
-  assert.equal(saved?.avoidFeedbackQuestions, true);
 };
 
-const testPolicyLearningAddsConcisePromptHint = async (): Promise<void> => {
-  const store = createInMemoryTurnRecordStore([
+const testPlanTasksBuildsInterveneFromCompletedOrganizeUnit = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId: buildUnitIdLike("ao", "thread-1", "stale_context", source),
       botId: "ao",
       threadId: "thread-1",
-      createdAtIso: "2026-05-29T00:00:00.000Z",
-      messages: [
-        {
-          role: "user",
-          content: "短めにお願いします。",
-          timestampIso: "2026-05-29T00:00:00.000Z",
-        },
-      ],
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "organize",
+      status: "internal_completed",
+      sourceSignals: [source],
+      organizeSummary: "最新の前提として短く共有できる。",
+      updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
   ]);
   const service = createRelationshipSystemService({
-    turnRecordStore: store,
+    turnRecordStore: createInMemoryTurnRecordStore(),
     policyStateStore: createInMemoryPolicyStateStore(),
+    workUnitStateStore: workUnitStore,
     memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+      getInsights: async () =>
+        createInsights({ proactiveContextCandidates: [source] }),
     },
   });
 
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
-  assert.match(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
-
-const testHeuristicPlanningAddsMemoryImprovementTask = async (): Promise<void> => {
-  const tasks = planRelationshipTasks(
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      report: {
-        gaps: ["Unknown preference."],
-        staleNotes: [],
-        conflicts: ["Conflicting recommended behavior detected for implementation support."],
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-      },
-    },
-    {
-      proactiveHelpLevel: "medium",
-      askForFeedbackSparingly: true,
-      maxBackgroundInputsPerRun: 2,
-    },
-    new Date("2026-05-29T00:00:00.000Z"),
-  );
-
-  assert.equal(tasks.at(-1)?.kind, "memory_improvement");
-  assert.match(tasks.at(-1)?.purpose ?? "", /memory system/i);
-};
-
-const testPolicyLearningPrefersMemoryInterventions = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "前回の区別を次回も維持します。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: ["Policy card is stale: pc-1"],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-  const saved = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
-  assert.equal(saved?.interventionFocus, "memory");
-  assert.equal(["info_gathering", "memory_improvement"].includes(tasks[0]?.kind ?? ""), true);
-};
-
-const testPolicyLearningSuppressesInfoGatheringWhenUserRejectsProactiveInfo = async (): Promise<void> => {
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "今は追加の情報は不要です。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: [],
-          staleNotes: ["Policy card is stale: pc-1"],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
-  assert.equal(tasks.some((task) => task.kind === "info_gathering"), false);
-};
-
-const testQuestionAvoidanceDeprioritizesAskUserTasks = async (): Promise<void> => {
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "質問は多すぎるので減らしてください。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-  });
-
+  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
+  assert.equal(tasks[0]?.unitStep, "intervene");
   assert.equal(tasks[0]?.executionMode, "provide_info");
-  assert.equal(tasks.at(-1)?.executionMode, "ask_user");
+  assert.match(tasks[0]?.inputText ?? "", /^補足です。/);
 };
 
-const testConcisePreferenceAlsoShortensProvideInfoTasks = async (): Promise<void> => {
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "短めにお願いします。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: createInMemoryPolicyStateStore(),
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: [],
-          staleNotes: [],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+const testObservationIsSuppressedWhenPolicyAvoidsFeedbackQuestions = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const workUnitStore = createInMemoryWorkUnitStateStore([
+    {
+      unitId: buildUnitIdLike("ao", "thread-1", "stale_context", source),
+      botId: "ao",
+      threadId: "thread-1",
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "intervene",
+      status: "intervened",
+      sourceSignals: [source],
+      lastInterventionText: "補足です。最新情報です。",
+      updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
-  });
-
-  const tasks = await service.planTasks({
+  ]);
+  const policyStateStore = createInMemoryPolicyStateStore({
     botId: "ao",
     threadId: "thread-1",
+    summary: "Avoid feedback questions.",
+    interventionFocus: "relationship",
+    preferredExecutionMode: "balanced",
+    avoidFeedbackQuestions: true,
+    preferConcisePrompts: false,
+    proactiveInfoPreference: "unknown",
+    updatedAtIso: "2026-05-29T00:00:00.000Z",
+  });
+  const service = createRelationshipSystemService({
+    turnRecordStore: createInMemoryTurnRecordStore(),
+    policyStateStore,
+    workUnitStateStore: workUnitStore,
+    memoryProvider: {
+      getInsights: async () =>
+        createInsights({ proactiveContextCandidates: [source] }),
+    },
   });
 
-  const provideInfoTask = tasks.find((task) => task.executionMode === "provide_info");
-  assert.match(provideInfoTask?.inputText ?? "", /Keep it brief/i);
+  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
+  assert.equal(tasks.length, 0);
 };
 
-const testDetailedPreferenceRelaxesConcisePromptPolicy = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
+const testConcisePolicyAppliesToUserFacingIntervention = async (): Promise<void> => {
+  const source = "Policy card is stale: pc-1";
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId: buildUnitIdLike("ao", "thread-1", "stale_context", source),
       botId: "ao",
       threadId: "thread-1",
-      summary: "The user prefers concise prompts.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: true,
-      proactiveInfoPreference: "unknown",
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "organize",
+      status: "internal_completed",
+      sourceSignals: [source],
+      organizeSummary: "最新の前提を一文で共有できる。",
       updatedAtIso: "2026-05-29T00:00:00.000Z",
     },
   ]);
+  const policyStateStore = createInMemoryPolicyStateStore({
+    botId: "ao",
+    threadId: "thread-1",
+    summary: "Prefer concise prompts.",
+    interventionFocus: "memory",
+    preferredExecutionMode: "provide_info",
+    avoidFeedbackQuestions: false,
+    preferConcisePrompts: true,
+    proactiveInfoPreference: "allow",
+    updatedAtIso: "2026-05-29T00:00:00.000Z",
+  });
   const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "次はもう少し詳しく説明してください。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
+    turnRecordStore: createInMemoryTurnRecordStore(),
+    policyStateStore,
+    workUnitStateStore: workUnitStore,
     memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
+      getInsights: async () =>
+        createInsights({ proactiveContextCandidates: [source] }),
     },
   });
 
   const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.preferConcisePrompts, false);
-  assert.doesNotMatch(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
-
-const testProactiveInfoWelcomeRelaxesAvoidPolicy = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "Avoid proactive information unless clearly useful.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "avoid",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "追加情報もあると助かります。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: [],
-          staleNotes: ["Policy card is stale: pc-1"],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.proactiveInfoPreference, "allow");
-  assert.equal(tasks.some((task) => task.kind === "info_gathering"), true);
-};
-
-const testFocusRemainsStableWithoutStrongNewSignal = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "Prefer relationship-improvement interventions first.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.interventionFocus, "relationship");
-};
-
-const testPreferredExecutionModePersistsWithoutNewSignal = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "Brief proactive information currently appears effective.",
-      interventionFocus: "balanced",
-      preferredExecutionMode: "provide_info",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.preferredExecutionMode, "provide_info");
-  assert.equal(tasks[0]?.executionMode, "ask_user");
-};
-
-const testPreferredExecutionModeCanShiftToProvideInfo = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "追加情報もあると助かります。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.preferredExecutionMode, "provide_info");
-  assert.equal(tasks.some((task) => task.executionMode === "provide_info"), true);
-};
-
-const testPolicyLearningUsesLongerWindowThanRecentSummary = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "追加情報もあると助かります。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:05:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:05:00.000Z",
-          },
-        ],
-      },
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "では次に進めます。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-    recentTurnLimit: 1,
-    policyLearningTurnLimit: 3,
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.preferredExecutionMode, "provide_info");
-  assert.equal(tasks.some((task) => task.executionMode === "provide_info"), true);
-};
-
-const testExecutionModeLearningUsesItsOwnLongerWindow = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "追加情報もあると助かります。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:05:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:05:00.000Z",
-          },
-        ],
-      },
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "では次に進めます。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-    recentTurnLimit: 1,
-    policyLearningTurnLimit: 1,
-    executionModeLearningTurnLimit: 3,
-  });
-
-  await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  const saved = await policyStore.getPolicyState({ botId: "ao", threadId: "thread-1" });
-
-  assert.equal(saved?.preferredExecutionMode, "provide_info");
-};
-
-const testFocusTakesPriorityOverPreferredExecutionMode = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "Prefer memory-improvement interventions first.",
-      interventionFocus: "memory",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: ["Policy card is stale: pc-1"],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  assert.equal(tasks[0]?.executionMode, "collect_info");
-};
-
-const testAskUserSuppressionOverridesPreferredExecutionMode = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "The user prefers fewer feedback questions.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: true,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "thread-1",
-        createdAtIso: "2026-05-29T00:10:00.000Z",
-        messages: [
-          {
-            role: "assistant",
-            content: "了解しました。",
-            timestampIso: "2026-05-29T00:10:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: ["Policy card is stale: pc-1"],
-          conflicts: ["Conflicting recommended behavior detected for implementation support."],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-1" });
-  assert.equal(tasks[tasks.length - 1]?.executionMode, "ask_user");
+  assert.match(tasks[0]?.inputText ?? "", /Keep it brief/i);
 };
 
 const testUserScopeSharesPolicyAcrossThreads = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "channel-a:user-1",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "短めにお願いします。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    policyScopeMode: "user",
-    memoryProvider: {
-      getInsights: async ({ threadId }) => ({
-        botId: "ao",
-        threadId,
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-  });
-
-  await service.planTasks({ botId: "ao", threadId: "channel-a:user-1" });
-  const tasks = await service.planTasks({ botId: "ao", threadId: "channel-b:user-1" });
-  const userScoped = await policyStore.getPolicyState({
+  const source = "Policy card is stale: pc-1";
+  const policyStore = createInMemoryPolicyStateStore({
     botId: "ao",
-    threadId: "user:user-1",
+    threadId: "user:u-1",
+    summary: "Prefer concise prompts.",
+    interventionFocus: "memory",
+    preferredExecutionMode: "provide_info",
+    avoidFeedbackQuestions: false,
+    preferConcisePrompts: true,
+    proactiveInfoPreference: "allow",
+    updatedAtIso: "2026-05-29T00:00:00.000Z",
   });
-
-  assert.equal(userScoped?.preferConcisePrompts, true);
-  assert.match(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
-
-const testHybridScopePrefersThreadOverride = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
+  const workUnitStore = createInMemoryWorkUnitStateStore([
     {
+      unitId: buildUnitIdLike("ao", "thread-a", "stale_context", source),
       botId: "ao",
-      threadId: "user:user-1",
-      summary: "The user prefers concise prompts.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: true,
-      proactiveInfoPreference: "unknown",
+      threadId: "thread-a",
+      kind: "stale_context",
+      title: "Refresh stale context",
+      currentStep: "organize",
+      status: "internal_completed",
+      sourceSignals: [source],
+      organizeSummary: "最新の前提を一文で共有できる。",
       updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-    {
-      botId: "ao",
-      threadId: "channel-a:user-1",
-      summary: "Detailed prompts are acceptable when useful.",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:05:00.000Z",
     },
   ]);
   const service = createRelationshipSystemService({
     turnRecordStore: createInMemoryTurnRecordStore(),
     policyStateStore: policyStore,
-    policyScopeMode: "hybrid",
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "channel-a:user-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "channel-a:user-1",
-  });
-
-  assert.doesNotMatch(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
-
-const testUserScopeUsesExplicitUserIdResolver = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "opaque-thread-a",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "短めにお願いします。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
+    workUnitStateStore: workUnitStore,
     policyScopeMode: "user",
-    userScopeKeyResolver: ({ userId }) =>
-      userId ? `user:${userId}` : null,
     memoryProvider: {
-      getInsights: async ({ threadId }) => ({
-        botId: "ao",
-        threadId,
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+      getInsights: async () =>
+        createInsights({
+          threadId: "thread-a",
+          proactiveContextCandidates: [source],
+        }),
     },
+    userScopeKeyResolver: () => "user:u-1",
   });
 
-  await service.planTasks({
-    botId: "ao",
-    threadId: "opaque-thread-a",
-    userId: "user-1",
-  });
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "opaque-thread-b",
-    userId: "user-1",
-  });
-  const userScoped = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "user:user-1",
-  });
-
-  assert.equal(userScoped?.preferConcisePrompts, true);
-  assert.match(tasks[0]?.inputText ?? "", /one short sentence/i);
+  const tasks = await service.planTasks({ botId: "ao", threadId: "thread-a", userId: "u-1" });
+  assert.match(tasks[0]?.inputText ?? "", /Keep it brief/i);
 };
 
-const testUserScopeFallsBackToThreadWhenUserKeyMissing = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "opaque-thread-a",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "短めにお願いします。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    policyScopeMode: "user",
-    userScopeMissingUserIdMode: "fallback_thread",
-    userScopeKeyResolver: () => null,
-    memoryProvider: {
-      getInsights: async ({ threadId }) => ({
-        botId: "ao",
-        threadId,
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
+test("planRelationshipTasks creates organize steps", testPlanRelationshipTasksCreatesOrganizeSteps);
+test("planRelationshipTasksWithLlm falls back to heuristic", testPlanRelationshipTasksWithLlmFallsBackToHeuristic);
+test("planRelationshipTasksWithLlm explains input and output schema", testPlanRelationshipTasksWithLlmExplainsInputAndOutputSchema);
+test("planRelationshipTasksWithLlm skips llm when base tasks are empty", testPlanRelationshipTasksWithLlmSkipsLlmWhenBaseTasksAreEmpty);
+test("buildRecentFeedbackSummaryWithLlm explains schema and passes minimal fields", testBuildRecentFeedbackSummaryWithLlmExplainsSchemaAndPassesMinimalFields);
+test("buildRecentFeedbackSummaryWithLlm skips llm without feedback probe", testBuildRecentFeedbackSummaryWithLlmSkipsLlmWithoutFeedbackProbe);
+test("summarizeOrganizeTaskWithLlm explains schema and passes minimal fields", testSummarizeOrganizeTaskWithLlmExplainsSchemaAndPassesMinimalFields);
+test("summarizeOrganizeTaskWithLlm skips llm for simple single-signal task", testSummarizeOrganizeTaskWithLlmSkipsLlmForSimpleSingleSignalTask);
+test("dispatch executes organize then intervenes", testDispatchExecutesOrganizeThenIntervenes);
+test("dispatch suppresses duplicate intervention", testDispatchSuppressesDuplicateIntervention);
+test("high priority conflict can repeat", testHighPriorityConflictCanRepeat);
+test("queue backlog suppresses dispatch", testQueueBacklogSuppressesDispatch);
+test("second dispatch creates observe step", testSecondDispatchCreatesObserveStep);
+test("unrelated user reply does not count as observation response", testUnrelatedUserReplyDoesNotCountAsObservationResponse);
+test("feedback-like reply updates observation", testFeedbackLikeReplyUpdatesObservation);
+test("planTasks skips waiting observe unit", testPlanTasksSkipsWaitingObserveUnit);
+test("planTasks builds intervene from completed organize unit", testPlanTasksBuildsInterveneFromCompletedOrganizeUnit);
+test("observation is suppressed when policy avoids feedback questions", testObservationIsSuppressedWhenPolicyAvoidsFeedbackQuestions);
+test("concise policy applies to user-facing intervention", testConcisePolicyAppliesToUserFacingIntervention);
+test("user scope shares policy across threads", testUserScopeSharesPolicyAcrossThreads);
+
+function createInsights(input: {
+  botId?: string;
+  threadId?: string;
+  clarificationCandidates?: string[];
+  proactiveContextCandidates?: string[];
+  repairCandidates?: string[];
+  boundaryCandidates?: string[];
+}): RelationshipMemoryInsights {
+  return {
+    botId: input.botId ?? "ao",
+    threadId: input.threadId ?? "thread-1",
+    report: {
+      clarificationCandidates: input.clarificationCandidates ?? [],
+      proactiveContextCandidates: input.proactiveContextCandidates ?? [],
+      repairCandidates: input.repairCandidates ?? [],
+      boundaryCandidates: input.boundaryCandidates ?? [],
+      createdAtIso: "2026-05-29T00:00:00.000Z",
     },
-  });
+  };
+}
 
-  await service.planTasks({
-    botId: "ao",
-    threadId: "opaque-thread-a",
-  });
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "opaque-thread-b",
-  });
-  const scopedA = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "opaque-thread-a",
-  });
-  const scopedB = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "opaque-thread-b",
-  });
+function defaultPolicy() {
+  return {
+    proactiveHelpLevel: "medium" as const,
+    askForFeedbackSparingly: true,
+    maxBackgroundInputsPerRun: 1,
+  };
+}
 
-  assert.equal(scopedA?.preferConcisePrompts, true);
-  assert.equal(scopedB?.preferConcisePrompts, undefined);
-  assert.doesNotMatch(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
+function assistantTurn(botId: string, threadId: string, createdAtIso: string, content: string): TurnRecord {
+  return {
+    botId,
+    threadId,
+    createdAtIso,
+    messages: [{ role: "assistant", content, timestampIso: createdAtIso }],
+  };
+}
 
-const testUserScopeSkipsWhenUserKeyMissingAndSkipModeEnabled = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore();
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore([
-      {
-        botId: "ao",
-        threadId: "opaque-thread-a",
-        createdAtIso: "2026-05-29T00:00:00.000Z",
-        messages: [
-          {
-            role: "user",
-            content: "短めにお願いします。",
-            timestampIso: "2026-05-29T00:00:00.000Z",
-          },
-        ],
-      },
-    ]),
-    policyStateStore: policyStore,
-    policyScopeMode: "user",
-    userScopeMissingUserIdMode: "skip_user_scope",
-    userScopeKeyResolver: () => null,
-    memoryProvider: {
-      getInsights: async ({ threadId }) => ({
-        botId: "ao",
-        threadId,
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:00:00.000Z",
-        },
-      }),
-    },
-  });
+function userTurn(botId: string, threadId: string, createdAtIso: string, content: string): TurnRecord {
+  return {
+    botId,
+    threadId,
+    createdAtIso,
+    messages: [{ role: "user", content, timestampIso: createdAtIso }],
+  };
+}
 
-  await service.planTasks({
-    botId: "ao",
-    threadId: "opaque-thread-a",
-  });
+function buildUnitIdLike(
+  botId: string,
+  threadId: string,
+  kind: RelationshipWorkUnitKind,
+  source: string,
+): string {
+  return `unit_${sanitize(botId)}_${sanitize(threadId)}_${kind}_${sanitize(source).slice(0, 64)}`;
+}
 
-  const scopedA = await policyStore.getPolicyState({
-    botId: "ao",
-    threadId: "opaque-thread-a",
-  });
-  assert.equal(scopedA, null);
-};
+function sanitize(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
 
-const testHybridScopeMergesWithThreadFieldPriority = async (): Promise<void> => {
-  const policyStore = createInMemoryPolicyStateStore([
-    {
-      botId: "ao",
-      threadId: "user:user-1",
-      summary: "User baseline summary",
-      interventionFocus: "memory",
-      preferredExecutionMode: "collect_info",
-      avoidFeedbackQuestions: true,
-      preferConcisePrompts: true,
-      proactiveInfoPreference: "allow",
-      updatedAtIso: "2026-05-29T00:00:00.000Z",
-    },
-    {
-      botId: "ao",
-      threadId: "thread-1",
-      summary: "Thread override summary",
-      interventionFocus: "relationship",
-      preferredExecutionMode: "ask_user",
-      avoidFeedbackQuestions: false,
-      preferConcisePrompts: false,
-      proactiveInfoPreference: "unknown",
-      updatedAtIso: "2026-05-29T00:05:00.000Z",
-    },
-  ]);
-  const service = createRelationshipSystemService({
-    turnRecordStore: createInMemoryTurnRecordStore(),
-    policyStateStore: policyStore,
-    policyScopeMode: "hybrid",
-    userScopeKeyResolver: ({ userId }) =>
-      userId ? `user:${userId}` : null,
-    memoryProvider: {
-      getInsights: async () => ({
-        botId: "ao",
-        threadId: "thread-1",
-        report: {
-          gaps: ["Unknown preference."],
-          staleNotes: [],
-          conflicts: [],
-          createdAtIso: "2026-05-29T00:10:00.000Z",
-        },
-      }),
-    },
-  });
-
-  const tasks = await service.planTasks({
-    botId: "ao",
-    threadId: "thread-1",
-    userId: "user-1",
-  });
-
-  assert.doesNotMatch(tasks[0]?.inputText ?? "", /one short sentence/i);
-};
-
-const createInMemoryTurnRecordStore = (
-  initial: TurnRecord[] = [],
-): RelationshipTurnRecordStore => {
+function createInMemoryTurnRecordStore(initial: TurnRecord[] = []): RelationshipTurnRecordStore {
   const items = [...initial];
   return {
     appendTurnRecord: async (turn) => {
@@ -1686,21 +704,41 @@ const createInMemoryTurnRecordStore = (
         .filter((turn) => turn.botId === botId && turn.threadId === threadId)
         .slice(-limit),
   };
-};
+}
 
-const createInMemoryPolicyStateStore = (
-  initial: RelationshipInterventionPolicyState[] = [],
-): RelationshipPolicyStateStore => {
-  const map = new Map(
-    initial.map((state) => [`${state.botId}:${state.threadId}`, state] as const),
-  );
+function createInMemoryPolicyStateStore(
+  initial: RelationshipInterventionPolicyState | null = null,
+): RelationshipPolicyStateStore {
+  const items = new Map<string, RelationshipInterventionPolicyState>();
+  if (initial) {
+    items.set(`${initial.botId}:${initial.threadId}`, initial);
+  }
   return {
-    getPolicyState: async ({ botId, threadId }) =>
-      map.get(`${botId}:${threadId}`) ?? null,
+    getPolicyState: async ({ botId, threadId }) => items.get(`${botId}:${threadId}`) ?? null,
     savePolicyState: async (state) => {
-      map.set(`${state.botId}:${state.threadId}`, state);
+      items.set(`${state.botId}:${state.threadId}`, state);
     },
   };
-};
+}
 
-void run();
+function createInMemoryWorkUnitStateStore(
+  initial: RelationshipWorkUnitState[] = [],
+): RelationshipWorkUnitStateStore {
+  const items = new Map<string, RelationshipWorkUnitState[]>();
+  for (const state of initial) {
+    const key = `${state.botId}:${state.threadId}`;
+    const current = items.get(key) ?? [];
+    current.push(state);
+    items.set(key, current);
+  }
+  return {
+    listWorkUnits: async ({ botId, threadId }) => items.get(`${botId}:${threadId}`) ?? [],
+    saveWorkUnit: async (state) => {
+      const key = `${state.botId}:${state.threadId}`;
+      const current = items.get(key) ?? [];
+      const next = current.filter((item) => item.unitId !== state.unitId);
+      next.push(state);
+      items.set(key, next);
+    },
+  };
+}

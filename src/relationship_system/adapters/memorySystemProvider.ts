@@ -4,29 +4,31 @@ import {
 } from "../domain/types";
 
 export interface MemorySystemLike {
-  generateMemoryReport(botId: string, threadId: string): Promise<{
+  generateRelationshipInsightReport(
+    botId: string,
+    threadId: string,
+  ): Promise<{
     botId: string;
     threadId: string;
-    gaps: string[];
-    staleNotes: string[];
-    conflicts: string[];
+    clarificationCandidates: string[];
+    proactiveContextCandidates: string[];
+    repairCandidates: string[];
+    boundaryCandidates: string[];
     createdAtIso: string;
   }>;
-  getRecentConversationContext?(
-    input: {
-      botId: string;
-      threadId: string;
-      limit?: number;
-      maxTokens?: number;
-    },
-  ): Promise<string>;
+  getRecentConversationContext?(input: {
+    botId: string;
+    threadId: string;
+    limit?: number;
+    maxTokens?: number;
+  }): Promise<string>;
 }
 
 export const createMemorySystemRelationshipMemoryProvider = (
   memorySystem: MemorySystemLike,
 ): RelationshipMemoryProvider => ({
   async getInsights(input): Promise<RelationshipMemoryInsights> {
-    const report = await memorySystem.generateMemoryReport(
+    const report = await memorySystem.generateRelationshipInsightReport(
       input.botId,
       input.threadId,
     );
@@ -35,16 +37,18 @@ export const createMemorySystemRelationshipMemoryProvider = (
       threadId: input.threadId,
       ...(memorySystem.getRecentConversationContext
         ? {
-            recentContextSummary: await memorySystem.getRecentConversationContext({
-              botId: input.botId,
-              threadId: input.threadId,
-            }),
+            recentContextSummary:
+              await memorySystem.getRecentConversationContext({
+                botId: input.botId,
+                threadId: input.threadId,
+              }),
           }
         : {}),
       report: {
-        gaps: report.gaps,
-        staleNotes: report.staleNotes,
-        conflicts: report.conflicts,
+        clarificationCandidates: report.clarificationCandidates,
+        proactiveContextCandidates: report.proactiveContextCandidates,
+        repairCandidates: report.repairCandidates,
+        boundaryCandidates: report.boundaryCandidates,
         createdAtIso: report.createdAtIso,
       },
     };

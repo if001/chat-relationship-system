@@ -2,7 +2,6 @@
   "name": "@chat-agent/relationship-system",
   "version": "0.1.0",
   "description": "Relationship system package for autonomous background task planning",
-  "type": "commonjs",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
@@ -10,7 +9,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx tests/service.test.ts && tsx tests/backgroundRunner.test.ts && tsx tests/adapter.test.ts && tsx tests/fileTurnRecordStore.test.ts && tsx tests/fileQueueBackgroundInputSink.test.ts && tsx tests/filePolicyStateStore.test.ts",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "start:background": "tsx --env-file=.env.ao src/cli/runBackground.ts"
   },
   "dependencies": {
@@ -19,7 +19,9 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^3.2.6",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.6"
   }
 }

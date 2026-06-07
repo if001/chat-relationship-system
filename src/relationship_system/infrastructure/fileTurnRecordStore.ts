@@ -1,9 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import {
-  RelationshipTurnRecordStore,
-  TurnRecord,
-} from "../domain/types";
+import { RelationshipTurnRecordStore, TurnRecord } from "../domain/types";
 
 interface BotTurnRecordFile {
   threads: Record<string, TurnRecord[]>;

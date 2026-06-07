@@ -6,4 +6,6 @@ export * from "./relationship_system/adapters/memorySystemProvider";
 export * from "./relationship_system/infrastructure/filePolicyStateStore";
 export * from "./relationship_system/infrastructure/fileTurnRecordStore";
 export * from "./relationship_system/infrastructure/fileQueueBackgroundInputSink";
+export * from "./relationship_system/infrastructure/fileWorkUnitStateStore";
 export * from "./relationship_system/infrastructure/ollama/client";
+export * from "./relationship_system/infrastructure/ollama/fileCachedModel";

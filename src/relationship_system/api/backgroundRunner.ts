@@ -56,7 +56,6 @@ export const createRelationshipBackgroundRunner = (
       }
       running = true;
       timer = setInterval(tick, pollMs);
-      timer.unref?.();
       tick();
     },
     stop(): void {

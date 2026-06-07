@@ -14,14 +14,27 @@ import {
   RelationshipTask,
   RelationshipTurnRecordStore,
   TurnRecord,
+  RelationshipWorkUnitState,
+  RelationshipWorkUnitStateStore,
 } from "../domain/types";
 import {
   buildMemoryReportSignature,
   buildTaskFingerprint,
   buildThreadKey,
+  isUserFacingTask,
+  normalizeUserFacingTaskText,
   planRelationshipTasks,
   planRelationshipTasksWithLlm,
   toBackgroundInput,
+} from "./taskPlanning";
+import { observeFeedbackResponse } from "./observeAdjust";
+import {
+  applyInterventionPolicyState,
+  learnInterventionPolicyState,
+} from "./policyLearning";
+export {
+  planRelationshipTasks,
+  planRelationshipTasksWithLlm,
 } from "./taskPlanning";
 
 export interface RelationshipSystemService {
@@ -52,6 +65,7 @@ export interface RelationshipSystemOptions {
   policyStateStore?: RelationshipPolicyStateStore;
   memoryProvider?: RelationshipMemoryProvider;
   backgroundInputSink?: BackgroundInputSink;
+  workUnitStateStore?: RelationshipWorkUnitStateStore;
   plannerModel?: RelationshipPlanningModel;
   policy?: Partial<RelationshipPolicy>;
   policyScopeMode?: "thread" | "user" | "hybrid";
@@ -63,6 +77,12 @@ export interface RelationshipSystemOptions {
   dispatchSuppressionWindowMs?: number;
   minTurnAgeMsBeforeLowPriorityDispatch?: number;
   minPolicyFlipIntervalMs?: number;
+  queueStatusProvider?: () => Promise<{
+    locked: number;
+    readyUser: number;
+    readyScheduled: number;
+  }>;
+  maxReadyQueueTasksBeforeSuppression?: number;
   now?: () => Date;
 }
 
@@ -74,6 +94,7 @@ const DEFAULT_POLICY: RelationshipPolicy = {
 
 class DefaultRelationshipSystemService implements RelationshipSystemService {
   private readonly policy: RelationshipPolicy;
+  private readonly workUnitStateStore: RelationshipWorkUnitStateStore;
   private readonly now: () => Date;
   private readonly recentTurnLimit: number;
   private readonly policyLearningTurnLimit: number;
@@ -88,6 +109,7 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
   private readonly dispatchSuppressionWindowMs: number;
   private readonly minTurnAgeMsBeforeLowPriorityDispatch: number;
   private readonly minPolicyFlipIntervalMs: number;
+  private readonly maxReadyQueueTasksBeforeSuppression: number;
   private readonly lastReportSignatureByThread = new Map<string, string>();
   private readonly lastDispatchedReportSignatureByThread = new Map<
     string,
@@ -105,6 +127,8 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       ...DEFAULT_POLICY,
       ...options.policy,
     };
+    this.workUnitStateStore =
+      options.workUnitStateStore ?? createInMemoryWorkUnitStateStore();
     this.now = options.now ?? (() => new Date());
     this.recentTurnLimit = Math.max(1, options.recentTurnLimit ?? 4);
     this.policyLearningTurnLimit = Math.max(
@@ -133,10 +157,15 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       0,
       options.minPolicyFlipIntervalMs ?? 30 * 60 * 1000,
     );
+    this.maxReadyQueueTasksBeforeSuppression = Math.max(
+      0,
+      options.maxReadyQueueTasksBeforeSuppression ?? 1,
+    );
   }
 
   async ingestTurnRecord(input: TurnRecord): Promise<void> {
     await this.options.turnRecordStore.appendTurnRecord(input);
+    await this.updateObservedWorkUnits(input);
   }
 
   async planTasks(input: {
@@ -153,21 +182,27 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       this.policyLearningTurnLimit,
       this.executionModeLearningTurnLimit,
     );
-    const [insights, recentTurns, currentPolicyState] = await Promise.all([
-      this.options.memoryProvider.getInsights(input),
-      this.options.turnRecordStore.listRecentTurnRecords({
-        botId: input.botId,
-        threadId: input.threadId,
-        limit: fetchTurnLimit,
-      }),
-      loadScopedPolicyState(
-        this.options.policyStateStore,
-        input,
-        this.policyScopeMode,
-        this.userScopeKeyResolver,
-        this.userScopeMissingUserIdMode,
-      ),
-    ]);
+    const [insights, recentTurns, currentPolicyState, workUnitStates] =
+      await Promise.all([
+        this.options.memoryProvider.getInsights(input),
+        this.options.turnRecordStore.listRecentTurnRecords({
+          botId: input.botId,
+          threadId: input.threadId,
+          limit: fetchTurnLimit,
+        }),
+        loadScopedPolicyState(
+          this.options.policyStateStore,
+          input,
+          this.policyScopeMode,
+          this.userScopeKeyResolver,
+          this.userScopeMissingUserIdMode,
+        ),
+        this.workUnitStateStore.listWorkUnits({
+          botId: input.botId,
+          threadId: input.threadId,
+        }),
+      ]);
+    console.log("insights", insights);
     const learningTurns = recentTurns.slice(-this.policyLearningTurnLimit);
     const executionModeLearningTurns = recentTurns.slice(
       -this.executionModeLearningTurnLimit,
@@ -194,10 +229,10 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       insights,
       recentTurns: learningTurns,
       executionModeLearningTurns,
+      workUnitStates,
       currentPolicyState,
       plannerModel: this.options.plannerModel,
     });
-
     if (nextPolicyState && this.options.policyStateStore) {
       await saveScopedPolicyState(
         this.options.policyStateStore,
@@ -232,17 +267,27 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
           }
         : {}),
     };
-
     const planned = this.options.plannerModel
       ? await planRelationshipTasksWithLlm(
           effectiveInsights,
           this.policy,
           this.now(),
           this.options.plannerModel,
+          workUnitStates,
         )
-      : planRelationshipTasks(effectiveInsights, this.policy, this.now());
-
-    return applyInterventionPolicyState(planned, effectivePolicyState);
+      : planRelationshipTasks(
+          effectiveInsights,
+          this.policy,
+          this.now(),
+          workUnitStates,
+        );
+    console.log("planned:", planned.length);
+    const tasks = applyInterventionPolicyState(
+      planned,
+      effectivePolicyState,
+    ).map(normalizeUserFacingTaskText);
+    console.log("tasks:", tasks.length);
+    return reconcilePlannedTasksWithWorkUnits(tasks, workUnitStates);
   }
 
   async dispatchTasks(input: {
@@ -256,10 +301,23 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
         "backgroundInputSink is required to dispatch relationship tasks",
       );
     }
-    const tasks = await this.planTasks(input);
+    let tasks = await this.planTasks(input);
+    const organizeTasks = tasks.filter((task) => task.unitStep === "organize");
+    await this.executeOrganizeTasks(organizeTasks);
+    if (organizeTasks.length > 0) {
+      tasks = await this.planTasks(input);
+    }
     const threadKey = buildThreadKey(input.botId, input.threadId);
     const nowMs = this.now().getTime();
-    const selected = tasks.slice(0, this.policy.maxBackgroundInputsPerRun);
+    if (await this.shouldSuppressForQueueBacklog()) {
+      process.stdout.write(
+        `[relationship-system] suppressed dispatch botId=${input.botId} threadId=${input.threadId} reason=queue_backlog\n`,
+      );
+      return [];
+    }
+    const selected = sortTasksForWorkUnitFlow(
+      tasks.filter(isUserFacingTask),
+    ).slice(0, this.policy.maxBackgroundInputsPerRun);
     if (
       this.shouldSuppressDispatch({
         threadKey,
@@ -279,6 +337,7 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
     for (const backgroundInput of backgroundInputs) {
       await this.options.backgroundInputSink.enqueue(backgroundInput);
     }
+    await this.persistWorkUnitStates(tasks, selected);
     if (selected.length > 0) {
       const reportSignature =
         this.lastReportSignatureByThread.get(threadKey) ?? "";
@@ -293,6 +352,119 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
       this.lastDispatchedAtByThread.set(threadKey, nowMs);
     }
     return backgroundInputs;
+  }
+
+  private async persistWorkUnitStates(
+    plannedTasks: RelationshipTask[],
+    selectedTasks: RelationshipTask[],
+  ): Promise<void> {
+    const nowIso = this.now().toISOString();
+    const selectedUnitIds = new Set(selectedTasks.map((task) => task.unitId));
+    for (const task of plannedTasks) {
+      if (task.unitStep === "organize") {
+        continue;
+      }
+      const selected = selectedUnitIds.has(task.unitId);
+      if (!selected) {
+        continue;
+      }
+      const state: RelationshipWorkUnitState = {
+        unitId: task.unitId,
+        botId: task.botId,
+        threadId: task.threadId,
+        kind: task.kind,
+        title: task.title,
+        currentStep: task.unitStep,
+        status:
+          task.unitStep === "observe" ? "waiting_for_response" : "intervened",
+        sourceSignals: task.sourceSignals,
+        ...(task.unitStep === "intervene"
+          ? {
+              lastInterventionText: task.inputText,
+            }
+          : {}),
+        ...(task.unitStep === "observe"
+          ? {
+              lastObservationPrompt: task.inputText,
+              responseWindowTurns: 3,
+            }
+          : {}),
+        lastInterventionAtIso: nowIso,
+        updatedAtIso: nowIso,
+      };
+      await this.workUnitStateStore.saveWorkUnit(state);
+    }
+  }
+
+  private async executeOrganizeTasks(tasks: RelationshipTask[]): Promise<void> {
+    if (tasks.length === 0) {
+      return;
+    }
+    const nowIso = this.now().toISOString();
+    for (const task of tasks) {
+      const organizeSummary = this.options.plannerModel
+        ? await summarizeOrganizeTaskWithLlm(task, this.options.plannerModel)
+        : summarizeOrganizeTaskHeuristically(task);
+      await this.workUnitStateStore.saveWorkUnit({
+        unitId: task.unitId,
+        botId: task.botId,
+        threadId: task.threadId,
+        kind: task.kind,
+        title: task.title,
+        currentStep: "organize",
+        status: "internal_completed",
+        sourceSignals: task.sourceSignals,
+        organizeSummary,
+        updatedAtIso: nowIso,
+      });
+    }
+  }
+
+  private async updateObservedWorkUnits(turn: TurnRecord): Promise<void> {
+    const units = await this.workUnitStateStore.listWorkUnits({
+      botId: turn.botId,
+      threadId: turn.threadId,
+    });
+    if (units.length === 0) {
+      return;
+    }
+    const recentTurns =
+      await this.options.turnRecordStore.listRecentTurnRecords({
+        botId: turn.botId,
+        threadId: turn.threadId,
+        limit: Math.max(8, this.recentTurnLimit + 4),
+      });
+    const nowIso = this.now().toISOString();
+    for (const unit of units) {
+      if (
+        unit.status !== "waiting_for_response" ||
+        !unit.lastInterventionAtIso
+      ) {
+        continue;
+      }
+      const observed = await observeFeedbackResponse(
+        recentTurns,
+        unit,
+        this.options.plannerModel,
+      );
+      if (observed.kind === "pending") {
+        continue;
+      }
+      await this.workUnitStateStore.saveWorkUnit({
+        ...unit,
+        currentStep: "adjust",
+        status:
+          observed.kind === "response_received"
+            ? "response_received"
+            : "no_signal",
+        ...(observed.kind === "response_received" && observed.responseText
+          ? {
+              observedResponseText: observed.responseText,
+            }
+          : {}),
+        updatedAtIso: nowIso,
+      });
+    }
   }
 
   private shouldSuppressDispatch(input: {
@@ -350,11 +522,39 @@ class DefaultRelationshipSystemService implements RelationshipSystemService {
     }
     return false;
   }
+
+  private async shouldSuppressForQueueBacklog(): Promise<boolean> {
+    if (!this.options.queueStatusProvider) {
+      return false;
+    }
+    const status = await this.options.queueStatusProvider();
+    return (
+      status.locked > 0 ||
+      status.readyUser > 0 ||
+      status.readyScheduled > this.maxReadyQueueTasksBeforeSuppression
+    );
+  }
 }
 
 export const createRelationshipSystemService = (
   options: RelationshipSystemOptions,
 ): RelationshipSystemService => new DefaultRelationshipSystemService(options);
+
+const createInMemoryWorkUnitStateStore = (): RelationshipWorkUnitStateStore => {
+  const items = new Map<string, RelationshipWorkUnitState[]>();
+  return {
+    async listWorkUnits(input) {
+      return items.get(buildThreadKey(input.botId, input.threadId)) ?? [];
+    },
+    async saveWorkUnit(state) {
+      const key = buildThreadKey(state.botId, state.threadId);
+      const current = items.get(key) ?? [];
+      const next = current.filter((item) => item.unitId !== state.unitId);
+      next.push(state);
+      items.set(key, next);
+    },
+  };
+};
 
 const loadScopedPolicyState = async (
   store: RelationshipPolicyStateStore | undefined,
@@ -492,23 +692,6 @@ interface FeedbackSummaryResult {
   signals?: string[];
 }
 
-interface LearnedPolicyStateResult {
-  summary?: string;
-  interventionFocus?: RelationshipInterventionFocus | string;
-  preferredExecutionMode?: RelationshipExecutionModePreference | string;
-  avoidFeedbackQuestions?: boolean;
-  preferConcisePrompts?: boolean;
-  proactiveInfoPreference?: ProactiveInfoPreference | string;
-}
-
-interface ExplicitPreferenceSignals {
-  avoidFeedbackQuestions?: boolean;
-  preferConcisePrompts?: boolean;
-  proactiveInfoPreference?: ProactiveInfoPreference;
-  relationshipFocusSignal: boolean;
-  preferredExecutionMode?: RelationshipExecutionModePreference;
-}
-
 const buildEffectiveContextSummary = (
   recentSummary?: string,
   policySummary?: string,
@@ -532,7 +715,7 @@ const buildRecentFeedbackSummary = (turns: TurnRecord[]): string => {
   ].join("\n");
 };
 
-const buildRecentFeedbackSummaryWithLlm = async (
+export const buildRecentFeedbackSummaryWithLlm = async (
   turns: TurnRecord[],
   plannerModel: RelationshipPlanningModel,
 ): Promise<string> => {
@@ -541,22 +724,27 @@ const buildRecentFeedbackSummaryWithLlm = async (
     return "";
   }
   const heuristic = buildFallbackFeedbackSummary(turns);
+  if (!hasRecentFeedbackProbe(turns)) {
+    return heuristic;
+  }
   const parsed = await plannerModel.generateJson<FeedbackSummaryResult>(
     [
-      "You analyze recent assistant-user turns to extract user feedback.",
-      "Focus on whether the assistant asked a clarification or preference question and what the user's response implies.",
-      "Prefer natural-language interpretation over rigid labels.",
-      "Return JSON only.",
+      "あなたは直近の assistant-user turn から user feedback を要約します。",
+      "recentTurns には assistant と user の message だけが時系列順で入っています。",
+      "assistant が clarification, preference, feedback question をしたか、その後の user reply が何を示しているかに注目してください。",
+      "硬直したラベル付けよりも自然言語での解釈を優先してください。",
+      "JSON のみを返してください。",
     ].join(" "),
     JSON.stringify({
       instruction: [
-        "Read the recent assistant and user turns.",
-        "If the assistant asked a clarification, preference, or feedback question, focus on the user's following response.",
-        "Summarize what the user's feedback implies for future interaction.",
-        "Return summary as a concise natural-language paragraph and optional signals[].",
+        "recentTurns を読んでください。",
+        "assistant が clarification, preference, feedback question をしている場合は、その後の user response に注目してください。",
+        "user の feedback が今後の対話に何を示唆するかを要約してください。",
+        "次の field を厳密に返してください:",
+        "- summary: 簡潔な自然言語の要約段落",
+        "- signals: 任意の短い根拠文字列",
       ].join(" "),
-      recentTurns: lines.join("\n"),
-      fallbackHeuristicSummary: heuristic,
+      recentTurns: lines,
     }),
   );
 
@@ -609,423 +797,106 @@ const buildFallbackFeedbackSummary = (turns: TurnRecord[]): string => {
   ].join("\n");
 };
 
-const learnInterventionPolicyState = async (input: {
-  botId: string;
-  threadId: string;
-  now: Date;
-  minPolicyFlipIntervalMs: number;
-  insights: RelationshipMemoryInsights;
-  recentTurns: TurnRecord[];
-  executionModeLearningTurns: TurnRecord[];
-  currentPolicyState: RelationshipInterventionPolicyState | null;
-  plannerModel?: RelationshipPlanningModel;
-}): Promise<RelationshipInterventionPolicyState | null> => {
-  if (input.recentTurns.length === 0) {
-    return input.currentPolicyState;
+const summarizeOrganizeTaskHeuristically = (task: RelationshipTask): string => {
+  const source = task.sourceSignals[0] ?? task.title;
+  switch (task.kind) {
+    case "preference_gap":
+      return `${source} について、次回はユーザーに一つだけ具体的な好みを確認する。`;
+    case "stale_context":
+      return `${source} を最新前提として短く整理し、必要なら先回りで共有する。`;
+    case "conflict_resolution":
+      return `${source} の違いを一文で説明できるように整理し、再発を防ぐ。`;
+    case "memory_boundary":
+      return `${source} について記憶の境界を明確にするため、短い確認文を用意する。`;
   }
-  if (input.plannerModel) {
-    const [learned, preferredExecutionMode] = await Promise.all([
-      learnInterventionPolicyStateWithLlm(
-        input.insights,
-        input.recentTurns,
-        input.currentPolicyState,
-        input.plannerModel,
-      ),
-      learnPreferredExecutionModeWithLlm(
-        input.executionModeLearningTurns,
-        input.currentPolicyState,
-        input.plannerModel,
-      ),
-    ]);
-    if (learned || preferredExecutionMode) {
-      const stabilized = stabilizeInterventionPolicyState(
-        input.insights,
-        input.now,
-        input.minPolicyFlipIntervalMs,
-        input.currentPolicyState,
-        {
-          summary: learned?.summary ?? input.currentPolicyState?.summary ?? "",
-          interventionFocus:
-            learned?.interventionFocus ??
-            input.currentPolicyState?.interventionFocus ??
-            "balanced",
-          preferredExecutionMode:
-            preferredExecutionMode ??
-            learned?.preferredExecutionMode ??
-            input.currentPolicyState?.preferredExecutionMode ??
-            "balanced",
-          avoidFeedbackQuestions:
-            learned?.avoidFeedbackQuestions ??
-            input.currentPolicyState?.avoidFeedbackQuestions ??
-            false,
-          preferConcisePrompts:
-            learned?.preferConcisePrompts ??
-            input.currentPolicyState?.preferConcisePrompts ??
-            false,
-          proactiveInfoPreference:
-            learned?.proactiveInfoPreference ??
-            input.currentPolicyState?.proactiveInfoPreference ??
-            "unknown",
-        },
-      );
-      return {
-        botId: input.botId,
-        threadId: input.threadId,
-        updatedAtIso: input.now.toISOString(),
-        ...stabilized,
-      };
-    }
-  }
-  const heuristic = learnInterventionPolicyStateHeuristically(
-    input.insights,
-    input.recentTurns,
-    input.currentPolicyState,
-  );
-  const heuristicPreferredExecutionMode =
-    learnPreferredExecutionModeHeuristically(
-      input.executionModeLearningTurns,
-      input.currentPolicyState,
-    );
-  if (!heuristic && !heuristicPreferredExecutionMode) {
-    return input.currentPolicyState;
-  }
-  const stabilized = stabilizeInterventionPolicyState(
-    input.insights,
-    input.now,
-    input.minPolicyFlipIntervalMs,
-    input.currentPolicyState,
-    {
-      summary: heuristic?.summary ?? input.currentPolicyState?.summary ?? "",
-      interventionFocus:
-        heuristic?.interventionFocus ??
-        input.currentPolicyState?.interventionFocus ??
-        "balanced",
-      preferredExecutionMode:
-        heuristicPreferredExecutionMode ??
-        heuristic?.preferredExecutionMode ??
-        input.currentPolicyState?.preferredExecutionMode ??
-        "balanced",
-      avoidFeedbackQuestions:
-        heuristic?.avoidFeedbackQuestions ??
-        input.currentPolicyState?.avoidFeedbackQuestions ??
-        false,
-      preferConcisePrompts:
-        heuristic?.preferConcisePrompts ??
-        input.currentPolicyState?.preferConcisePrompts ??
-        false,
-      proactiveInfoPreference:
-        heuristic?.proactiveInfoPreference ??
-        input.currentPolicyState?.proactiveInfoPreference ??
-        "unknown",
-    },
-    detectExplicitPreferenceSignals(
-      input.recentTurns
-        .flatMap((turn) => turn.messages)
-        .filter((message) => message.role === "user")
-        .map((message) => message.content.trim())
-        .filter(Boolean),
-    ),
-  );
-  return {
-    botId: input.botId,
-    threadId: input.threadId,
-    updatedAtIso: input.now.toISOString(),
-    ...stabilized,
-  };
 };
 
-const learnInterventionPolicyStateWithLlm = async (
-  insights: RelationshipMemoryInsights,
-  turns: TurnRecord[],
-  currentPolicyState: RelationshipInterventionPolicyState | null,
+export const summarizeOrganizeTaskWithLlm = async (
+  task: RelationshipTask,
   plannerModel: RelationshipPlanningModel,
-): Promise<Omit<
-  RelationshipInterventionPolicyState,
-  "botId" | "threadId" | "updatedAtIso"
-> | null> => {
-  const lines = formatRecentTurns(turns, 10);
-  if (lines.length === 0) {
-    return null;
+): Promise<string> => {
+  if (task.sourceSignals.length <= 1) {
+    return summarizeOrganizeTaskHeuristically(task);
   }
-  const parsed = await plannerModel.generateJson<LearnedPolicyStateResult>(
+  const parsed = await plannerModel.generateJson<{ summary?: string }>(
     [
-      "You update a lightweight intervention policy for an assistant.",
-      "Decide whether the assistant should focus on relationship improvement, memory improvement, or keep a balanced approach.",
-      "Decide which execution mode currently appears most effective: ask_user, collect_info, provide_info, or balanced.",
-      "Also decide whether the assistant should reduce feedback questions, keep prompts concise, and avoid or allow proactive information.",
-      "Return JSON only.",
+      "あなたは relationship-support Work Unit の organize step の結果を要約します。",
+      "organizeStep には、完了した内部 organize step についての最小情報だけが入っています。",
+      "次の user-facing intervention を導ける短い 1 文を作ってください。",
+      "JSON のみを返してください。",
     ].join(" "),
     JSON.stringify({
       instruction: [
-        "Read the recent turns, the memory insights, and the current policy summary.",
-        "Infer whether the next background intervention should focus more on relationship improvement, memory improvement, or stay balanced.",
-        "Infer which execution mode currently seems most effective: ask_user, collect_info, provide_info, or balanced.",
-        "Infer the user's preference about prompting frequency, prompt conciseness, and proactive information.",
-        "Return summary, interventionFocus, preferredExecutionMode, avoidFeedbackQuestions, preferConcisePrompts, proactiveInfoPreference.",
+        "organizeStep を読んでください。",
+        "整理結果を、次の intervention step のための簡潔な 1 文に要約してください。",
+        "厳密に { summary: string } を返してください。",
       ].join(" "),
-      insights,
-      currentPolicyState,
-      recentTurns: lines.join("\n"),
+      organizeStep: {
+        kind: task.kind,
+        title: task.title,
+        purpose: task.purpose,
+        sourceSignals: task.sourceSignals,
+        inputText: task.inputText,
+      },
     }),
   );
-
-  const summary = parsed.summary?.trim();
-  if (!summary) {
-    return null;
-  }
-  return {
-    summary,
-    interventionFocus: normalizeInterventionFocus(parsed.interventionFocus),
-    preferredExecutionMode: normalizeExecutionModePreference(
-      parsed.preferredExecutionMode,
-    ),
-    avoidFeedbackQuestions: Boolean(parsed.avoidFeedbackQuestions),
-    preferConcisePrompts: Boolean(parsed.preferConcisePrompts),
-    proactiveInfoPreference: normalizeProactiveInfoPreference(
-      parsed.proactiveInfoPreference,
-    ),
-  };
+  return parsed.summary?.trim() || summarizeOrganizeTaskHeuristically(task);
 };
 
-const learnPreferredExecutionModeWithLlm = async (
-  turns: TurnRecord[],
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-  plannerModel: RelationshipPlanningModel,
-): Promise<RelationshipExecutionModePreference | null> => {
-  const lines = formatRecentTurns(turns, 16);
-  if (lines.length === 0) {
-    return null;
-  }
-  const parsed = await plannerModel.generateJson<{
-    preferredExecutionMode?: RelationshipExecutionModePreference | string;
-  }>(
-    [
-      "You infer which execution mode currently seems most effective for relationship-support tasks.",
-      "Choose one of: ask_user, collect_info, provide_info, balanced.",
-      "Return JSON only.",
-    ].join(" "),
-    JSON.stringify({
-      instruction: [
-        "Read the recent turns and the current policy state.",
-        "Infer which execution mode currently appears most effective over this longer span.",
-        "Return preferredExecutionMode.",
-      ].join(" "),
-      currentPolicyState,
-      recentTurns: lines.join("\n"),
-    }),
-  );
-  if (parsed.preferredExecutionMode === undefined) {
-    return null;
-  }
-  return normalizeExecutionModePreference(parsed.preferredExecutionMode);
-};
-
-const learnInterventionPolicyStateHeuristically = (
-  insights: RelationshipMemoryInsights,
-  turns: TurnRecord[],
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-): Omit<
-  RelationshipInterventionPolicyState,
-  "botId" | "threadId" | "updatedAtIso"
-> | null => {
-  const userMessages = turns
-    .flatMap((turn) => turn.messages)
-    .filter((message) => message.role === "user")
-    .map((message) => message.content.trim())
-    .filter(Boolean);
-
-  const explicitSignals = detectExplicitPreferenceSignals(userMessages);
-  const interventionFocus = decideInterventionFocusHeuristically(
-    insights,
-    explicitSignals,
-    currentPolicyState,
-  );
-  const preferredExecutionMode =
-    explicitSignals.preferredExecutionMode ??
-    currentPolicyState?.preferredExecutionMode ??
-    "balanced";
-
-  const summaryParts = [
-    interventionFocus === "relationship"
-      ? "Prefer relationship-improvement interventions first."
-      : interventionFocus === "memory"
-        ? "Prefer memory-improvement interventions first."
-        : currentPolicyState?.interventionFocus === "relationship"
-          ? "Keep favoring relationship-improvement interventions."
-          : currentPolicyState?.interventionFocus === "memory"
-            ? "Keep favoring memory-improvement interventions."
-            : "",
-    explicitSignals.avoidFeedbackQuestions === true
-      ? "The user prefers fewer feedback questions."
-      : explicitSignals.avoidFeedbackQuestions === false
-        ? "The user appears open to occasional feedback questions."
-        : currentPolicyState?.avoidFeedbackQuestions
-          ? "The user still appears to prefer fewer feedback questions."
-          : "",
-    explicitSignals.preferConcisePrompts === true
-      ? "The user prefers concise prompts."
-      : explicitSignals.preferConcisePrompts === false
-        ? "The user appears comfortable with more detailed prompts."
-        : currentPolicyState?.preferConcisePrompts
-          ? "The user still appears to prefer concise prompts."
-          : "",
-    explicitSignals.proactiveInfoPreference === "avoid"
-      ? "Avoid proactive information unless clearly useful."
-      : explicitSignals.proactiveInfoPreference === "allow"
-        ? "Proactive information is welcome when useful."
-        : preferredExecutionMode === "ask_user"
-          ? "Direct user questions appear effective when needed."
-          : preferredExecutionMode === "provide_info"
-            ? "Brief proactive information appears effective."
-            : preferredExecutionMode === "collect_info"
-              ? "Background information collection appears effective."
-              : (currentPolicyState?.summary ?? ""),
-  ].filter(Boolean);
-
-  if (summaryParts.length === 0) {
-    return null;
-  }
-
-  return {
-    summary: summaryParts.join(" "),
-    interventionFocus,
-    preferredExecutionMode,
-    avoidFeedbackQuestions:
-      explicitSignals.avoidFeedbackQuestions ??
-      currentPolicyState?.avoidFeedbackQuestions ??
-      false,
-    preferConcisePrompts:
-      explicitSignals.preferConcisePrompts ??
-      currentPolicyState?.preferConcisePrompts ??
-      false,
-    proactiveInfoPreference:
-      explicitSignals.proactiveInfoPreference ??
-      currentPolicyState?.proactiveInfoPreference ??
-      "unknown",
-  };
-};
-
-const learnPreferredExecutionModeHeuristically = (
-  turns: TurnRecord[],
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-): RelationshipExecutionModePreference | null => {
-  const userMessages = turns
-    .flatMap((turn) => turn.messages)
-    .filter((message) => message.role === "user")
-    .map((message) => message.content.trim())
-    .filter(Boolean);
-  const explicitSignals = detectExplicitPreferenceSignals(userMessages);
-  if (explicitSignals.preferredExecutionMode) {
-    return explicitSignals.preferredExecutionMode;
-  }
-  return currentPolicyState?.preferredExecutionMode ?? null;
-};
-
-const stabilizeInterventionPolicyState = (
-  insights: RelationshipMemoryInsights,
-  now: Date,
-  minPolicyFlipIntervalMs: number,
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-  candidate: Omit<
-    RelationshipInterventionPolicyState,
-    "botId" | "threadId" | "updatedAtIso"
-  >,
-  explicitSignals?: ExplicitPreferenceSignals,
-): Omit<
-  RelationshipInterventionPolicyState,
-  "botId" | "threadId" | "updatedAtIso"
-> => {
-  const stabilizedFocus = stabilizeInterventionFocus(
-    candidate.interventionFocus,
-    insights,
-    now,
-    minPolicyFlipIntervalMs,
-    explicitSignals,
-    currentPolicyState,
-  );
-  const preferredExecutionMode = stabilizePreferredExecutionMode(
-    candidate.preferredExecutionMode,
-    now,
-    minPolicyFlipIntervalMs,
-    explicitSignals,
-    currentPolicyState,
-  );
-  const avoidFeedbackQuestions =
-    explicitSignals?.avoidFeedbackQuestions ??
-    candidate.avoidFeedbackQuestions ??
-    currentPolicyState?.avoidFeedbackQuestions ??
-    false;
-  const preferConcisePrompts =
-    explicitSignals?.preferConcisePrompts ??
-    candidate.preferConcisePrompts ??
-    currentPolicyState?.preferConcisePrompts ??
-    false;
-  const proactiveInfoPreference =
-    explicitSignals?.proactiveInfoPreference ??
-    candidate.proactiveInfoPreference ??
-    currentPolicyState?.proactiveInfoPreference ??
-    "unknown";
-
-  return {
-    summary: buildPolicyStateSummary({
-      summary: candidate.summary,
-      interventionFocus: stabilizedFocus,
-      preferredExecutionMode,
-      avoidFeedbackQuestions,
-      preferConcisePrompts,
-      proactiveInfoPreference,
-    }),
-    interventionFocus: stabilizedFocus,
-    preferredExecutionMode,
-    avoidFeedbackQuestions,
-    preferConcisePrompts,
-    proactiveInfoPreference,
-  };
-};
-
-const applyInterventionPolicyState = (
+const reconcilePlannedTasksWithWorkUnits = (
   tasks: RelationshipTask[],
-  policyState: RelationshipInterventionPolicyState | null,
+  workUnits: RelationshipWorkUnitState[],
 ): RelationshipTask[] => {
-  if (!policyState) {
+  if (workUnits.length === 0) {
     return tasks;
   }
-  const filtered = tasks
-    .filter((task) => {
-      if (
-        policyState.avoidFeedbackQuestions &&
-        task.kind === "feedback_prepare"
-      ) {
-        return false;
-      }
-      if (
-        policyState.proactiveInfoPreference === "avoid" &&
-        task.kind === "info_gathering"
-      ) {
-        return false;
-      }
+  const byUnitId = new Map(
+    workUnits.map((unit) => [unit.unitId, unit] as const),
+  );
+  return tasks.filter((task) => {
+    const unit = byUnitId.get(task.unitId);
+    if (!unit) {
       return true;
-    })
-    .map((task) => {
-      if (!policyState.preferConcisePrompts) {
-        return task;
-      }
-      if (task.executionMode === "ask_user") {
-        return {
-          ...task,
-          inputText: `${task.inputText} Keep it to one short sentence.`,
-        };
-      }
-      if (task.executionMode === "provide_info") {
-        return {
-          ...task,
-          inputText: `${task.inputText} Keep it brief.`,
-        };
-      }
-      return task;
-    });
+    }
+    if (unit.status === "waiting_for_response") {
+      return false;
+    }
+    if (
+      unit.currentStep === "intervene" &&
+      unit.status === "intervened" &&
+      task.unitStep === "intervene"
+    ) {
+      return false;
+    }
+    if (
+      unit.currentStep === "organize" &&
+      unit.status === "internal_completed" &&
+      task.executionMode === "collect_info"
+    ) {
+      return false;
+    }
+    if (
+      unit.currentStep === "adjust" &&
+      (unit.status === "response_received" || unit.status === "no_signal")
+    ) {
+      return false;
+    }
+    return true;
+  });
+};
 
-  return sortTasksByPolicyState(filtered, policyState);
+const sortTasksForWorkUnitFlow = (
+  tasks: RelationshipTask[],
+): RelationshipTask[] => {
+  const order: Record<RelationshipTask["unitStep"], number> = {
+    organize: 0,
+    intervene: 1,
+    observe: 2,
+    adjust: 3,
+  };
+  return [...tasks].sort(
+    (left, right) => order[left.unitStep] - order[right.unitStep],
+  );
 };
 
 const formatRecentTurns = (turns: TurnRecord[], limit: number = 8): string[] =>
@@ -1058,277 +929,13 @@ const detectFeedbackSignal = (content: string): string | null => {
   return null;
 };
 
-const detectExplicitPreferenceSignals = (
-  userMessages: string[],
-): ExplicitPreferenceSignals => {
-  const joined = userMessages.join("\n");
-  const avoidFeedbackQuestions =
-    /(too many|多すぎ|減ら|うるさい|no more questions)/i.test(joined)
-      ? true
-      : /(質問して|確認して|聞いて).*(大丈夫|ok|ください|欲しい)|質問は.*(大丈夫|歓迎)/i.test(
-            joined,
-          )
-        ? false
-        : undefined;
-  const preferConcisePrompts = /(shorter|短く|brief|簡潔|短め)/i.test(joined)
-    ? true
-    : /(詳しく|詳細|丁寧|長め|more detail|detailed)/i.test(joined)
-      ? false
-      : undefined;
-  const proactiveInfoPreference =
-    /(not now|不要|いらない|later|今は.*不要)/i.test(joined)
-      ? "avoid"
-      : /(先回り|補足|追加情報|積極的).*(ほしい|欲しい|歓迎|助か)|追加情報.*あると.*助か|どんどん.*教えて/i.test(
-            joined,
-          )
-        ? "allow"
-        : undefined;
-  const preferredExecutionMode =
-    /(確認して|質問して|聞いて).*(助か|歓迎|大丈夫|ほしい|欲しい)/i.test(joined)
-      ? "ask_user"
-      : /(追加情報|補足|先回り).*(助か|歓迎|ほしい|欲しい)/i.test(joined)
-        ? "provide_info"
-        : /(調べて|整理して|集めて).*(助か|歓迎|ほしい|欲しい)/i.test(joined)
-          ? "collect_info"
-          : undefined;
-  return {
-    avoidFeedbackQuestions,
-    preferConcisePrompts,
-    proactiveInfoPreference,
-    relationshipFocusSignal:
-      avoidFeedbackQuestions !== undefined ||
-      preferConcisePrompts !== undefined ||
-      proactiveInfoPreference !== undefined,
-    preferredExecutionMode,
-  };
-};
-
-const stabilizeInterventionFocus = (
-  candidate: RelationshipInterventionFocus,
-  insights: RelationshipMemoryInsights,
-  now: Date,
-  minPolicyFlipIntervalMs: number,
-  explicitSignals: ExplicitPreferenceSignals | undefined,
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-): RelationshipInterventionFocus => {
-  if (explicitSignals?.relationshipFocusSignal) {
-    return "relationship";
-  }
-  if (
-    insights.report.conflicts.length > 0 ||
-    insights.report.staleNotes.length > 0
-  ) {
-    return "memory";
-  }
-  if (currentPolicyState?.interventionFocus) {
-    if (
-      candidate !== currentPolicyState.interventionFocus &&
-      !isPolicyFlipAllowed(now, currentPolicyState, minPolicyFlipIntervalMs)
-    ) {
-      return currentPolicyState.interventionFocus;
-    }
-    return currentPolicyState.interventionFocus;
-  }
-  return candidate;
-};
-
-const buildPolicyStateSummary = (state: {
-  summary?: string;
-  interventionFocus: RelationshipInterventionFocus;
-  preferredExecutionMode: RelationshipExecutionModePreference;
-  avoidFeedbackQuestions: boolean;
-  preferConcisePrompts: boolean;
-  proactiveInfoPreference: ProactiveInfoPreference;
-}): string => {
-  const parts = [
-    state.interventionFocus === "relationship"
-      ? "Prefer relationship-improvement interventions first."
-      : state.interventionFocus === "memory"
-        ? "Prefer memory-improvement interventions first."
-        : "Keep relationship and memory interventions balanced.",
-    state.avoidFeedbackQuestions
-      ? "The user prefers fewer feedback questions."
-      : "Occasional feedback questions are acceptable.",
-    state.preferConcisePrompts
-      ? "The user prefers concise prompts."
-      : "Detailed prompts are acceptable when useful.",
-    state.preferredExecutionMode === "ask_user"
-      ? "Direct user questions currently appear effective."
-      : state.preferredExecutionMode === "provide_info"
-        ? "Brief proactive information currently appears effective."
-        : state.preferredExecutionMode === "collect_info"
-          ? "Background information collection currently appears effective."
-          : "",
-    state.proactiveInfoPreference === "avoid"
-      ? "Avoid proactive information unless clearly useful."
-      : state.proactiveInfoPreference === "allow"
-        ? "Proactive information is welcome when useful."
-        : "",
-    state.summary?.trim() ?? "",
-  ].filter(Boolean);
-  return Array.from(new Set(parts)).join(" ");
-};
-
-const normalizeProactiveInfoPreference = (
-  value: ProactiveInfoPreference | string | undefined,
-): ProactiveInfoPreference => {
-  if (value === "allow" || value === "avoid" || value === "unknown") {
-    return value;
-  }
-  return "unknown";
-};
-
-const normalizeInterventionFocus = (
-  value: RelationshipInterventionFocus | string | undefined,
-): RelationshipInterventionFocus => {
-  if (value === "balanced" || value === "relationship" || value === "memory") {
-    return value;
-  }
-  return "balanced";
-};
-
-const normalizeExecutionModePreference = (
-  value: RelationshipExecutionModePreference | string | undefined,
-): RelationshipExecutionModePreference => {
-  if (
-    value === "balanced" ||
-    value === "ask_user" ||
-    value === "collect_info" ||
-    value === "provide_info"
-  ) {
-    return value;
-  }
-  return "balanced";
-};
-
-const decideInterventionFocusHeuristically = (
-  insights: RelationshipMemoryInsights,
-  explicitSignals: ExplicitPreferenceSignals,
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-): RelationshipInterventionFocus => {
-  if (explicitSignals.relationshipFocusSignal) {
-    return "relationship";
-  }
-  if (
-    insights.report.conflicts.length > 0 ||
-    insights.report.staleNotes.length > 0
-  ) {
-    return "memory";
-  }
-  return currentPolicyState?.interventionFocus ?? "balanced";
-};
-
-const sortTasksByPolicyState = (
-  tasks: RelationshipTask[],
-  policyState: RelationshipInterventionPolicyState,
-): RelationshipTask[] => {
-  const focus = policyState.interventionFocus;
-  if (focus === "balanced") {
-    return sortTasksByExecutionModePreference(tasks, policyState);
-  }
-  const order =
-    focus === "relationship"
-      ? [
-          "feedback_prepare",
-          "context_hint",
-          "memory_improvement",
-          "info_gathering",
-        ]
-      : [
-          "memory_improvement",
-          "info_gathering",
-          "context_hint",
-          "feedback_prepare",
-        ];
-  return sortTasksByExecutionModePreference(
-    [...tasks].sort(
-      (left, right) => order.indexOf(left.kind) - order.indexOf(right.kind),
-    ),
-    policyState,
-  );
-};
-
-const sortTasksByExecutionModePreference = (
-  tasks: RelationshipTask[],
-  policyState: RelationshipInterventionPolicyState,
-): RelationshipTask[] => {
-  const order = buildExecutionModeOrder(policyState);
-  const preferredIndex =
-    policyState.preferredExecutionMode === "balanced"
-      ? -1
-      : order.indexOf(policyState.preferredExecutionMode);
-  return [...tasks].sort((left, right) => {
-    const leftRank = order.indexOf(left.executionMode);
-    const rightRank = order.indexOf(right.executionMode);
-    if (leftRank !== rightRank) {
-      return leftRank - rightRank;
-    }
-    if (preferredIndex < 0) {
-      return 0;
-    }
-    const leftPreferred = left.executionMode === order[preferredIndex];
-    const rightPreferred = right.executionMode === order[preferredIndex];
-    if (leftPreferred === rightPreferred) {
-      return 0;
-    }
-    return leftPreferred ? -1 : 1;
-  });
-};
-
-const buildExecutionModeOrder = (
-  policyState: RelationshipInterventionPolicyState,
-): RelationshipExecutionMode[] => {
-  // Hard guard: when feedback questions should be minimized, ask_user always trails.
-  if (policyState.avoidFeedbackQuestions) {
-    return ["provide_info", "collect_info", "ask_user"];
-  }
-  // Focus drives the primary ordering; preferredExecutionMode is a tie-breaker.
-  if (policyState.proactiveInfoPreference === "avoid") {
-    return ["ask_user", "collect_info", "provide_info"];
-  }
-  if (policyState.interventionFocus === "memory") {
-    return ["collect_info", "ask_user", "provide_info"];
-  }
-  if (policyState.interventionFocus === "relationship") {
-    return ["ask_user", "provide_info", "collect_info"];
-  }
-  return ["ask_user", "provide_info", "collect_info"];
-};
-
-const stabilizePreferredExecutionMode = (
-  candidate: RelationshipExecutionModePreference,
-  now: Date,
-  minPolicyFlipIntervalMs: number,
-  explicitSignals: ExplicitPreferenceSignals | undefined,
-  currentPolicyState: RelationshipInterventionPolicyState | null,
-): RelationshipExecutionModePreference => {
-  if (explicitSignals?.preferredExecutionMode) {
-    return explicitSignals.preferredExecutionMode;
-  }
-  if (candidate !== "balanced") {
-    if (
-      currentPolicyState?.preferredExecutionMode &&
-      candidate !== currentPolicyState.preferredExecutionMode &&
-      !isPolicyFlipAllowed(now, currentPolicyState, minPolicyFlipIntervalMs)
-    ) {
-      return currentPolicyState.preferredExecutionMode;
-    }
-    return candidate;
-  }
-  return currentPolicyState?.preferredExecutionMode ?? "balanced";
-};
-
-const isPolicyFlipAllowed = (
-  now: Date,
-  currentPolicyState: RelationshipInterventionPolicyState,
-  minPolicyFlipIntervalMs: number,
-): boolean => {
-  if (minPolicyFlipIntervalMs <= 0) {
-    return true;
-  }
-  const lastUpdatedMs = Date.parse(currentPolicyState.updatedAtIso);
-  if (!Number.isFinite(lastUpdatedMs)) {
-    return true;
-  }
-  return now.getTime() - lastUpdatedMs >= minPolicyFlipIntervalMs;
-};
+const hasRecentFeedbackProbe = (turns: TurnRecord[]): boolean =>
+  turns
+    .flatMap((turn) => turn.messages)
+    .some(
+      (message) =>
+        message.role === "assistant" &&
+        /(頻度|多すぎ|減ら|補足|確認).*教えて|feedback|too frequent|too many questions|reduce|確認頻度/i.test(
+          message.content,
+        ),
+    );

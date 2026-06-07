@@ -2,11 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { test } from "vitest";
 import { createFileRelationshipTurnRecordStore } from "../src/relationship_system/infrastructure/fileTurnRecordStore";
-
-const run = async (): Promise<void> => {
-  await testFileTurnRecordStoreAppendsAndListsRecentTurns();
-};
 
 const testFileTurnRecordStoreAppendsAndListsRecentTurns = async (): Promise<void> => {
   const dir = await mkdtemp(join(tmpdir(), "relationship-store-"));
@@ -68,4 +65,4 @@ const testFileTurnRecordStoreAppendsAndListsRecentTurns = async (): Promise<void
   }
 };
 
-void run();
+test("file turn record store appends and lists recent turns", testFileTurnRecordStoreAppendsAndListsRecentTurns);
